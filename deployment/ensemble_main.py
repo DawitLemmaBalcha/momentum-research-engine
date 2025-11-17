@@ -13,7 +13,8 @@ import logging
 import threading
 import pandas as pd
 import pandas_ta as ta
-from collections import deque
+# --- *** FIX: Added defaultdict *** ---
+from collections import deque, defaultdict
 from dotenv import load_dotenv
 # --- MODIFIED: Load .env from project root ---
 dotenv_path = os.path.join(project_root, 'api.env')
@@ -22,10 +23,9 @@ load_dotenv(dotenv_path=dotenv_path)
 from typing import List, Dict, Callable
 
 from deployment.ensemble_config import VENUES
-# --- *** THE CRITICAL FIX *** ---
-# Import the Model C (shared) bot, not the Model A bot
-from core.trading_bot_shared import MomentumAnchorBot
-# --- *** END FIX *** ---
+# --- *** RENAMED *** ---
+from core.trading_bot_shared import MomentumAnchorBotShared
+# --- *** END RENAMED *** ---
 from core.core_types import SimulationClock, Tick, Position # <-- MODIFIED: Added Position
 
 # --- Setup Basic Logging ---
@@ -59,18 +59,21 @@ class LiveDataManager:
     """
     Manages all live data streams (ticks, 1m, 30m) for a single venue.
     Calculates indicators in real-time and routes data to the correct bots.
-    This class solves the "dummy indicator" problem.
     """
-    def __init__(self, bots: List[MomentumAnchorBot], connector):
+    def __init__(self, bots: List[MomentumAnchorBotShared], connector):
         self.bots = bots
         self.connector = connector
-        self.bots_by_symbol: Dict[str, List[MomentumAnchorBot]] = {}
+        self.bots_by_symbol: Dict[str, List[MomentumAnchorBotShared]] = {}
         
         # Stores the latest calculated indicator values
         self.indicator_state_by_symbol: Dict[str, Dict] = {}
         
         # Stores the rolling candle data
         self.dataframes: Dict[str, pd.DataFrame] = {}
+
+        # --- *** FIX: Store all unique 1m params needed, per symbol *** ---
+        self.unique_1m_rsi_periods_by_symbol = defaultdict(set)
+        self.unique_1m_vol_ma_periods_by_symbol = defaultdict(set)
         
         # Map bots to symbols
         for bot in self.bots:
@@ -79,13 +82,15 @@ class LiveDataManager:
             self.bots_by_symbol[bot.symbol].append(bot)
             self.indicator_state_by_symbol[bot.symbol] = {} # Init state
             
+            # --- *** FIX: Collect all unique params *** ---
+            self.unique_1m_rsi_periods_by_symbol[bot.symbol].add(bot.config.CONFIRMATION_RSI_PERIOD)
+            self.unique_1m_vol_ma_periods_by_symbol[bot.symbol].add(bot.config.CONFIRMATION_VOLUME_MA_PERIOD)
 
     def _parse_candle(self, candle_data) -> dict:
         """
         Helper to parse a Bybit kline (from REST or WebSocket).
         """
         if isinstance(candle_data, dict):
-            # --- THIS IS THE FIX ---
             # Handle WebSocket format: {'start': '...', 'open': ...}
             return {
                 "timestamp": pd.to_datetime(int(candle_data['start']), unit='ms'),
@@ -95,7 +100,6 @@ class LiveDataManager:
                 "close": float(candle_data['close']),
                 "volume": float(candle_data['volume']),
             }
-            # --- END FIX ---
         else:
             # Handle REST API format: [timestamp, open, high, low, close, volume, ...]
             return {
@@ -117,7 +121,6 @@ class LiveDataManager:
             symbol_bybit = symbol.replace('/', '')
             
             try:
-                # --- ASSUMPTION: Connector has a 'get_kline' method ---
                 # Fetch initial 1m data
                 kline_1m = self.connector.session.get_kline(
                     category="linear", 
@@ -140,34 +143,51 @@ class LiveDataManager:
                 
                 # Run initial calculations
                 self._calculate_1m_indicators(symbol)
-                # Calculate initial 30m indicators and store the latest row
-                self.indicator_state_by_symbol[symbol]['30m_row'] = self._calculate_30m_indicators(symbol)
+                
+                # --- *** RENAMED & UPDATED *** ---
+                initial_30m_anchor_data = self._calculate_30m_indicators(symbol)
+                self.indicator_state_by_symbol[symbol]['30m_row'] = initial_30m_anchor_data
                 logger.info(f"Successfully primed data for {symbol}")
+
+                if initial_30m_anchor_data:
+                    logger.info(f"Initializing bot state for {symbol}...")
+                    for bot in self.bots_by_symbol[symbol]:
+                        bot.initialize_state(initial_30m_anchor_data)
+                else:
+                    logger.error(f"Failed to get initial 30m data for {symbol}, bots will not start with active anchors.")
+                # --- *** END RENAMED & UPDATED *** ---
 
             except Exception as e:
                 logger.error(f"Failed to prime data for {symbol}: {e}. This symbol will not trade.")
                 
     def _calculate_1m_indicators(self, symbol: str):
-        """Calculates and stores the latest 1-minute confirmation indicators."""
+        """
+        Calculates all unique 1-minute confirmation indicators.
+        --- UPDATED TO MATCH BACKTESTER (PATH 1) ---
+        """
         df = self.dataframes.get(f"{symbol}_1m")
         if df is None or df.empty:
             return
 
-        # Get the config from the first bot for this symbol (assumes all bots on symbol share params)
-        config = self.bots_by_symbol[symbol][0].config
-        
-        # Calculate indicators
-        df['rsi_1m'] = ta.rsi(df['close'], length=config.CONFIRMATION_RSI_PERIOD)
-        df['volume_ma_1m'] = df['volume'].rolling(window=config.CONFIRMATION_VOLUME_MA_PERIOD).mean()
-        macd_1m = ta.macd(df['close'], fast=config.CONFIRMATION_MACD_FAST_PERIOD, slow=config.CONFIRMATION_MACD_SLOW_PERIOD, signal=config.CONFIRMATION_MACD_SIGNAL_PERIOD)
-        df['macd_1m'] = macd_1m[f'MACD_{config.CONFIRMATION_MACD_FAST_PERIOD}_{config.CONFIRMATION_MACD_SLOW_PERIOD}_{config.CONFIRMATION_MACD_SIGNAL_PERIOD}']
+        # Get all unique periods for this symbol
+        rsi_periods = self.unique_1m_rsi_periods_by_symbol[symbol]
+        vol_ma_periods = self.unique_1m_vol_ma_periods_by_symbol[symbol]
 
-        # Store the *latest complete* (t-1) indicator values
-        if len(df) > 1:
-            latest_indicators = df.iloc[-2] # Use -2 to get the last *closed* candle's data
-            self.indicator_state_by_symbol[symbol]['1m_row'] = latest_indicators
-            # Store prev_row for lookahead-safe volume
-            self.indicator_state_by_symbol[symbol]['prev_1m_row'] = df.iloc[-3] if len(df) > 2 else latest_indicators
+        # Get one config just for the static MACD params
+        config = self.bots_by_symbol[symbol][0].config
+
+        # --- *** FIX: Loop over all unique periods AND ADD .shift(1) *** ---
+        for p in rsi_periods:
+            df[f'rsi_1m_{p}'] = ta.rsi(df['close'], length=p).shift(1)
+
+        for p in vol_ma_periods:
+            df[f'volume_ma_1m_{p}'] = df['volume'].rolling(window=p).mean().shift(1)
+        # --- *** END FIX *** ---
+
+        macd_1m = ta.macd(df['close'], fast=config.CONFIRMATION_MACD_FAST_PERIOD, slow=config.CONFIRMATION_MACD_SLOW_PERIOD, signal=config.CONFIRMATION_MACD_SIGNAL_PERIOD)
+        
+        # --- *** FIX: ADD .shift(1) to MACD as well *** ---
+        df[f'macd_1m_{config.CONFIRMATION_MACD_FAST_PERIOD}_{config.CONFIRMATION_MACD_SLOW_PERIOD}_{config.CONFIRMATION_MACD_SIGNAL_PERIOD}'] = macd_1m[f'MACD_{config.CONFIRMATION_MACD_FAST_PERIOD}_{config.CONFIRMATION_MACD_SLOW_PERIOD}_{config.CONFIRMATION_MACD_SIGNAL_PERIOD}'].shift(1)
 
     def _calculate_30m_indicators(self, symbol: str) -> dict:
         """Calculates 30m strategy indicators and returns the latest row."""
@@ -181,7 +201,12 @@ class LiveDataManager:
         df['short_ema'] = ta.ema(df['close'], length=config.SHORT_EMA_PERIOD)
         df['long_ema'] = ta.ema(df['close'], length=config.LONG_EMA_PERIOD)
         df['rsi'] = ta.rsi(df['close'], length=config.RSI_PERIOD)
-        df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=config.ATR_PERIOD)
+        
+        # Duplicate ATR column to match bot expectation
+        atr_val = ta.atr(df['high'], df['low'], df['close'], length=config.ATR_PERIOD)
+        df['atr'] = atr_val # For generic use (e.g., exits)
+        df[f'atr_{config.ATR_PERIOD}'] = atr_val # For the bot's confirmation check
+        
         macd = ta.macd(df['close'], fast=config.MACD_FAST_PERIOD, slow=config.MACD_SLOW_PERIOD, signal=config.MACD_SIGNAL_PERIOD)
         df['macd'] = macd[f'MACD_{config.MACD_FAST_PERIOD}_{config.MACD_SLOW_PERIOD}_{config.MACD_SIGNAL_PERIOD}']
         bbands = ta.bbands(df['close'], length=config.BOLLINGER_PERIOD, std=config.BOLLINGER_STD_DEV)
@@ -200,8 +225,6 @@ class LiveDataManager:
         Determines the current market trend and regime from a data row.
         This is a helper for logging in the LiveDataManager.
         """
-        # Get the config from the first bot for this symbol
-        # (Assumes all bots on a symbol share the 30m base parameters)
         try:
             config = self.bots_by_symbol[symbol][0].config
         except (KeyError, IndexError):
@@ -210,9 +233,6 @@ class LiveDataManager:
         
         c = config
         
-        # This implementation is copied from core/trading_bot_base.py
-        # It's designed to read the simple dict keys (e.g., 'short_ema')
-        # that are returned by _calculate_30m_indicators.
         try:
             short_ma = data_row.get('short_ema')
             long_ma = data_row.get('long_ema')
@@ -220,7 +240,7 @@ class LiveDataManager:
             macd = data_row.get('macd')
             bb_upper = data_row.get('bb_upper')
             bb_lower = data_row.get('bb_lower')
-            current_price = data_row.get('close') # Use .get() for safety
+            current_price = data_row.get('close')
             
             if any(v is None for v in [short_ma, long_ma, rsi, macd, bb_upper, bb_lower, current_price]):
                 logger.warning(f"[_get_trend_regime] Missing key indicator data in row.")
@@ -246,22 +266,18 @@ class LiveDataManager:
     def start_all_streams(self):
         """
         Subscribes to all required streams for all symbols.
-        This now uses the bifurcated (split) stream strategy.
         """
         logger.info(f"Starting data streams for all symbols...")
         
-        # --- 1. Start all PUBLIC (tick and kline) streams ---
         for symbol in self.bots_by_symbol.keys():
             try:
                 # 1.a Tick Stream (Public)
-                # This calls the new method in your connector
                 self.connector.start_public_stream(
                     symbol=symbol,
                     on_tick_callback=self._on_tick
                 )
                 
                 # 1.b 1-Minute Candle Stream (Public - kline)
-                # The connector's base class handles kline streams
                 self.connector.start_kline_stream(
                     symbol=symbol,
                     interval="1",
@@ -278,9 +294,8 @@ class LiveDataManager:
             except Exception as e:
                 logger.error(f"Failed to start public streams for {symbol}: {e}")
 
-        # --- 2. Start one PRIVATE (account) stream ---
         try:
-            # This calls the second new method in your connector
+            # Start one PRIVATE (account) stream
             self.connector.start_private_stream(
                 on_private_callback=self._on_private_message
             )
@@ -291,26 +306,35 @@ class LiveDataManager:
     def _on_private_message(self, message: dict):
         """
         Callback for private WebSocket messages (orders, positions).
-        This is not used for logic, but is good for logging.
         """
         logger.info(f"Received Private WebSocket Data: {message}")
 
 
     def _on_1m_candle(self, candle_data, symbol: str):
-        """Callback for when a new 1-minute candle arrives."""
+        """
+        Callback for when a new 1-minute candle arrives.
+        """
         try:
             candle_dict = self._parse_candle(candle_data)
-            df = self.dataframes[f"{symbol}_1m"]
+            df = self.dataframes.get(f"{symbol}_1m", pd.DataFrame())
             
-            # Append new candle and keep dataframe size managed
             new_df = pd.concat([df, pd.DataFrame([candle_dict])], ignore_index=True)
             if len(new_df) > MAX_DATAFRAME_LENGTH:
                 new_df = new_df.iloc[-MAX_DATAFRAME_LENGTH:]
             
             self.dataframes[f"{symbol}_1m"] = new_df
             
-            # Recalculate and store the latest indicators
+            # Recalculate indicators (modifies df in-place)
             self._calculate_1m_indicators(symbol)
+            
+            updated_df = self.dataframes[f"{symbol}_1m"]
+
+            # Store the correct rows for the bot (t-1 and t-2)
+            if len(updated_df) > 1:
+                self.indicator_state_by_symbol[symbol]['1m_row'] = updated_df.iloc[-1]
+            if len(updated_df) > 2:
+                self.indicator_state_by_symbol[symbol]['prev_1m_row'] = updated_df.iloc[-2]
+
         except Exception as e:
             logger.error(f"Error processing 1m candle for {symbol}: {e}")
 
@@ -334,7 +358,7 @@ class LiveDataManager:
             if not strategy_data_row:
                 return
             
-            # Store it for use in _on_tick
+            # Store it for use by _on_tick
             self.indicator_state_by_symbol[symbol]['30m_row'] = strategy_data_row
 
             new_regime = self._get_trend_regime(strategy_data_row, symbol)
@@ -354,25 +378,16 @@ class LiveDataManager:
         This is the new 'route_tick_to_bots'
         """
         try:
-            # Get the latest *stored* indicator rows
             state = self.indicator_state_by_symbol.get(symbol, {})
-            current_1m_row = state.get('1m_row')
-            prev_1m_row = state.get('prev_1m_row')
-            current_30m_row = state.get('30m_row')
+            current_1m_row = state.get('1m_row')   # This is the `t-1` row
+            prev_1m_row = state.get('prev_1m_row')     # This is the `t-2` row
+            current_30m_row = state.get('30m_row') # This is the latest closed 30m row
 
-            if not isinstance(current_1m_row, pd.Series) or not isinstance(prev_1m_row, pd.Series) or not current_30m_row:
-                # Data is not fully primed yet, skip
-                return
+            if not isinstance(current_1m_row, pd.Series) or not current_30m_row:
+                return # Data not primed
 
-            # --- This is the fix to align with the Model C backtester ---
-            # We create a "merged row" on the fly that the bot expects.
-            # It's the latest 1m data combined with the latest 30m data.
-            # We pass this as `current_row` and the previous 1m row as `prev_row`.
-            
-            # Combine 1m and 30m data into one series
-            # Note: 1m row keys will overwrite 30m if there are duplicates (e.g., 'close')
-            # which is the desired behavior from `merge_asof`.
-            merged_current_row = pd.Series(current_30m_row)._append(current_1m_row)
+            # Merge the 30m anchor data with the latest 1m confirmation data
+            merged_current_row = pd.concat([pd.Series(current_30m_row), current_1m_row])
             
             # The 'atr' for exits is from the 30m row
             atr_30m = current_30m_row.get('atr', 0.0)
@@ -381,14 +396,14 @@ class LiveDataManager:
                 bot.clock.current_time = tick.timestamp
                 bot.clock.current_price = tick.price
                 
-                # --- THIS IS THE FIX ---
-                # Pass the data in the format the refactored Model C bot expects:
-                # (tick, current_row, prev_row)
+                # --- *** RENAMED FUNCTION CALL *** ---
+                # This function now checks for 1m confirmation against pending anchor signals
                 bot.check_confirmation_on_tick(
                     tick,
-                    merged_current_row, # <-- The combined (t-1) 1m and 30m data
-                    prev_1m_row         # <-- The (t-2) 1m data (for safe volume)
+                    merged_current_row, # `data_row`: Has 30m data + 1m(t-1) indicators
+                    current_1m_row      # `prev_data_row`: Has 1m(t-1) volume
                 )
+                # --- *** END RENAMED FUNCTION CALL *** ---
                 
                 # Exits use the (t-1) 30m ATR
                 bot.check_exits_on_1m(tick.price, atr_30m)
@@ -404,14 +419,12 @@ class LiveDataManager:
 class Venue:
     """
     Manages a single trading venue (e.g., one exchange account).
-    This class now runs the portfolio sync loop in a separate thread.
-    This solves the "shared capital" problem.
     """
     def __init__(self, name, config):
         self.name = name
         self.config = config
         self.connector = None
-        self.bots: List[MomentumAnchorBot] = []
+        self.bots: List[MomentumAnchorBotShared] = []
         self.is_ready = False
         
         self.master_peak_capital = 0.0
@@ -434,10 +447,7 @@ class Venue:
 
         self.connector = connector_class(**connection_params)
 
-        # --- *** MODIFICATION 1: Reverted back to "USD" *** ---
-        # Your screenshot confirms the demo account uses USD.
         live_balance = self.connector.get_wallet_balance(coin="USDT")
-        # --- *** END MODIFICATION *** ---
         
         if live_balance <= 0:
             logger.error(f"Venue '{self.name}' has zero or invalid balance ({live_balance}). Cannot start bots.")
@@ -450,11 +460,9 @@ class Venue:
             logger.warning(f"Venue '{self.name}' has no strategies assigned.")
             return False
             
-        # --- MODIFIED: Correctly calculate capital allocation for Model C ---
         total_requested_capital = 0
         strategy_configs = []
         
-        # First pass: load configs and sum requested capital
         for strategy_path in self.config["strategies"]:
             spec = importlib.util.spec_from_file_location(strategy_path, strategy_path)
             strategy_module = importlib.util.module_from_spec(spec)
@@ -464,52 +472,43 @@ class Venue:
 
         logger.info(f"Venue '{self.name}' live balance is {live_balance:,.2f} USDT. Sizing allocation will be based on strategy weights (total requested: ${total_requested_capital:,.2f}).")
 
-
-        # Second pass: create bots and set their allocation
-        for strategy_module in strategy_configs: # <--- Use the original, simple loop
+        for strategy_module in strategy_configs:
             clock = SimulationClock(start_time=time.time())
             
-            # Calculate capital allocation
             bot_allocation = strategy_module.INITIAL_CAPITAL / total_requested_capital if total_requested_capital > 0 else 1.0 / num_bots_in_venue
 
-            bot = MomentumAnchorBot(
+            # --- *** RENAMED *** ---
+            bot = MomentumAnchorBotShared(
                 initial_capital=live_balance,
                 simulation_clock=clock,
                 config_module=strategy_module,
                 connector=self.connector,
                 silent=False
             )
+            # --- *** END RENAMED *** ---
             bot.capital_allocation = bot_allocation 
             bot.portfolio_initial_capital = live_balance 
             
-            # --- THIS IS THE REAL FIX ---
-            # Get the file path directly from the loaded module object
             strategy_file_path = strategy_module.__file__
             strategy_name = strategy_file_path.split('/')[-1].replace('.py', '')
             bot.bot_id = f"{self.name}_{strategy_name}"
-            # --- END FIX ---
             
-
             bot_logger = logging.getLogger(bot.bot_id)
             bot_logger.setLevel(logging.INFO)
-            bot_logger.propagate = False # Don't send bot logs to the main (root) logger
+            bot_logger.propagate = False
 
-            # 2. Create the directory for logs if it doesn't exist
             log_directory = os.path.join(project_root, 'logs', self.name)
             os.makedirs(log_directory, exist_ok=True)
             
-            # 3. Create a file handler for this bot's log
             log_file_path = os.path.join(log_directory, f"{strategy_name}.log")
             bot_file_handler = logging.FileHandler(log_file_path)
             bot_file_handler.setFormatter(
                 logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
             )
             
-            # 4. Add the handler to the bot's logger
             if not bot_logger.hasHandlers():
                 bot_logger.addHandler(bot_file_handler)
 
-            # 5. Give the bot its own logger instance
             bot.logger = bot_logger
 
 
@@ -517,8 +516,7 @@ class Venue:
             logger.info(f"Initialized bot: {bot.bot_id} on Venue: {self.name} for symbol {bot.symbol} with {bot.capital_allocation:.2%} allocation.")
 
         
-        # --- *** NEW: STATE HYDRATION ON STARTUP *** ---
-        # This implements the state persistence fix.
+        # --- State Hydration ---
         try:
             logger.info(f"[{self.name}] Hydrating bot state from exchange...")
             exchange_positions = self.connector.get_open_positions()
@@ -529,23 +527,20 @@ class Venue:
                 side = ex_pos['side']
                 entry_price = ex_pos['entry_price']
                 
-                # Find the bot(s) responsible for this symbol
                 found_bot = False
                 for bot in self.bots:
                     if bot.symbol.replace('/', '') == symbol:
                         logger.warning(f"Found orphaned position for {symbol}: {side} {qty} @ {entry_price}")
                         
-                        # Create a new Position object
                         new_pos = Position(
                             entry_price=entry_price,
                             amount=qty,
                             is_long=(side == 'Buy')
                         )
-                        new_pos.id = "orphaned_" + str(int(time.time())) # Give it a placeholder ID
-                        new_pos.entry_time = time.time() # Set entry time to now
+                        new_pos.id = "orphaned_" + str(int(time.time()))
+                        new_pos.entry_time = time.time()
                         new_pos.symbol = bot.symbol
                         
-                        # Add to the bot's list
                         bot.open_positions.append(new_pos)
                         found_bot = True
                 
@@ -556,10 +551,7 @@ class Venue:
             
         except Exception as e:
             logger.error(f"CRITICAL: Failed to hydrate bot state: {e}. Positions may be orphaned.", exc_info=True)
-        # --- *** END OF STATE HYDRATION *** ---
         
-        
-        # Setup the data manager for this venue's bots
         self.data_manager = LiveDataManager(self.bots, self.connector)
         
         return True
@@ -570,10 +562,7 @@ class Venue:
             logger.info(f"Connecting Venue: {self.name}...")
             self.connector.connect()
             
-            # Prime data *before* starting streams
             self.data_manager.prime_all_data()
-            
-            # Start all streams (Tick, 1m, 30m)
             self.data_manager.start_all_streams()
 
     def start_portfolio_sync(self):
@@ -586,15 +575,12 @@ class Venue:
         """
         Re-calculates and injects new capital_allocation weights for each bot
         based on their current sizing_multiplier (performance).
-        (This is copied from the shared backtest runner)
         """
         
-        # 1. Get all current performance weights (sizing_multiplier)
         weights = [bot.sizing_multiplier for bot in self.bots]
         total_weight = sum(weights)
         
         if total_weight <= 0:
-            # Emergency case: all bots are de-risked to zero.
             num_bots = len(self.bots)
             if num_bots > 0:
                 equal_allocation = 1.0 / num_bots
@@ -602,7 +588,6 @@ class Venue:
                     bot.capital_allocation = equal_allocation
             return
 
-        # 2. Calculate and inject new allocations
         for i, bot in enumerate(self.bots):
             new_allocation = weights[i] / total_weight
             bot.capital_allocation = new_allocation
@@ -613,7 +598,6 @@ class Venue:
         state with all bot instances.
         """
         while True:
-            # --- ** THIS IS THE FIX: The try/except block is moved INSIDE the loop ** ---
             try:
                 # 1. Get Realized Capital
                 realized_capital = self.connector.get_wallet_balance("USDT")
@@ -621,14 +605,14 @@ class Venue:
                 # 2. Calculate Unrealized PnL
                 unrealized_pnl = 0.0
                 try:
-                    open_positions = self.connector.get_open_positions() # Uses new base method
+                    open_positions = self.connector.get_open_positions()
                     for pos in open_positions:
                         symbol = pos['symbol']
                         entry_price = float(pos['entry_price'])
                         qty = float(pos['qty'])
-                        side = pos['side'] # 'Buy' or 'Sell'
+                        side = pos['side']
                         
-                        mark_price = self.connector.get_mark_price(symbol) # Uses new base method
+                        mark_price = self.connector.get_mark_price(symbol)
 
                         if mark_price > 0:
                             if side == 'Buy':
@@ -657,19 +641,15 @@ class Venue:
                 # 6. Re-calculate portfolio-wide allocations based on new multipliers
                 self._update_dynamic_allocations()
                 
-                # --- ** NEW: Cosmetic Logging Enhancement ** ---
-                # Get allocation strings from each bot
                 alloc_strs = []
                 for bot in self.bots:
                     try:
-                        # Try to get the clean name (e.g., "cluster_1_1")
                         bot_name = bot.bot_id.split(f"{self.name}_")[-1]
                     except Exception:
-                        bot_name = bot.bot_id # Fallback
+                        bot_name = bot.bot_id
                     alloc_strs.append(f"{bot_name}: {bot.capital_allocation:.1%}")
                 alloc_summary = ", ".join(alloc_strs)
 
-                # Log a rich, single-line summary to the main ensemble log
                 logger.info(
                     f"💰 [PORTFOLIO_SYNC] | "
                     f"Equity: ${current_total_equity:,.2f} "
@@ -677,12 +657,8 @@ class Venue:
                     f"Peak: ${self.master_peak_capital:,.2f} | "
                     f"Allocations: [{alloc_summary}]"
                 )
-                # --- ** END NEW LOGGING ** ---
 
             except Exception as e:
-                # --- ** THIS IS THE FIX ** ---
-                # This log now reports a *failed cycle*, not a failed loop.
-                # The loop will sleep and try again.
                 logger.error(f"CRITICAL: Portfolio sync CYCLE failed for venue '{self.name}': {e}")
             
             time.sleep(PORTFOLIO_SYNC_INTERVAL_SECONDS)
@@ -697,9 +673,6 @@ class Venue:
 #  MAIN EXECUTION
 # ==============================================================================
 
-# --- *** NEW: ADDED ENSEMBLE TRADER CLASS *** ---
-# This was missing from the original file but is required
-# for the main execution block to run.
 class EnsembleTrader:
     def __init__(self, venues_config: Dict):
         self.venues: List[Venue] = []
@@ -719,10 +692,7 @@ class EnsembleTrader:
             for venue in self.venues:
                 logger.info(f"--- Starting Venue: {venue.name} ---")
                 
-                # Connect and start data streams (this is blocking)
                 venue.connect_and_run_streams()
-                
-                # Start the portfolio sync in a separate thread
                 venue.start_portfolio_sync()
 
             logger.info("All venues running. Waiting for exit signal (Ctrl+C).")
@@ -736,16 +706,10 @@ class EnsembleTrader:
                 venue.disconnect()
             logger.info("Ensemble trader shut down.")
 
-# --- *** END NEW CLASS *** ---
-
 
 if __name__ == "__main__":
-    # --- THIS FIX IS REQUIRED ---
-    # The original file had a bad path for the .env file
-    # This ensures it loads from the project root, where api.env is.
     dotenv_path = os.path.join(project_root, 'api.env')
     load_dotenv(dotenv_path=dotenv_path)
-    # --- END FIX ---
 
     if len(sys.argv) < 2:
         print("ERROR: Please specify which venue to run.")

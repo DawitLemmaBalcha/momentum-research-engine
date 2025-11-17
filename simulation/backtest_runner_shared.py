@@ -313,7 +313,7 @@ class SimulationEngine:
             self.portfolio_equity_curve.append((current_row['timestamp'].timestamp(), current_total_equity))
             # --- END FIX ---
             
-            if trial and i % 1000 == 0:
+            if trial and i > 30000 and i % 1000 == 0:
                 trial.report(current_total_equity, i) 
                 if trial.should_prune():
                     raise optuna.TrialPruned()

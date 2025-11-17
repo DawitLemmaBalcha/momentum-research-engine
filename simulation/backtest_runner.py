@@ -180,7 +180,7 @@ class SimulationEngine:
             
             
             # --- Pruning Check ---
-            if trial and i % 1000 == 0:
+            if trial and i > 30000 and i % 1000 == 0:
                 trial.report(current_portfolio_equity, i) # Report equity
                 if trial.should_prune():
                     raise optuna.TrialPruned()
