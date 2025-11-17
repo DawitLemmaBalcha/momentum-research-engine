@@ -54,7 +54,7 @@ class MomentumAnchorBotShared(MomentumAnchorBotBase):
         *** THIS CONTAINS THE LOOKAHEAD BIAS FIX ***
         """
         
-        # --- NEW: Config & Data Lookups ---
+        # --- Config & Data Lookups ---
         c = self.config
         try:
             # 1m Confirmaton Lookups
@@ -83,6 +83,10 @@ class MomentumAnchorBotShared(MomentumAnchorBotBase):
         for order in self.pending_anchor_signals[:]:
             if (order.order_type == "buy" and tick.price >= order.price) or (order.order_type == "sell" and tick.price <= order.price):
 
+                # --- FIX 1 (SPAM): Remove anchor immediately on trigger. ---
+                # This stops it from being re-triggered on every tick.
+                self.pending_anchor_signals.remove(order)
+
                 volume_ok = volume_1m > (volume_ma_1m * getattr(self.config, 'VOLUME_CONFIRMATION_FACTOR', 1.0))
 
                 if order.order_type == "buy": rsi_ok, macd_ok = rsi_1m > self.config.RSI_BUY_CONFIRMATION, macd_1m > 0
@@ -104,15 +108,12 @@ class MomentumAnchorBotShared(MomentumAnchorBotBase):
                         "volume_req": volume_ma_1m * getattr(self.config, 'VOLUME_CONFIRMATION_FACTOR', 1.0)
                     }
                     
-                    self.execute_pyramid_entry(order, size, details, atr)
-
-                    # Check the return value of the execution
+                    # --- FIX 2 (DUPLICATE): The duplicate call has been removed. ---
+                    # This is the one and only call.
                     trade_successful = self.execute_pyramid_entry(order, size, details, atr)
 
-                    # Only remove the anchor if the trade was successfully placed
-                    if trade_successful:
-                        self.pending_anchor_signals.remove(order)
-
+                    # We no longer check `if trade_successful:` to remove the order,
+                    # as it was already removed in FIX 1.
                 
                 else:
                     # --- START FIX ---
@@ -135,6 +136,7 @@ class MomentumAnchorBotShared(MomentumAnchorBotBase):
 
                     # Update the last known reason
                     order.last_rejection_reason = rejection_string
+
 
 
     def calculate_position_size(self, price: float, return_details: bool = False) -> float | Tuple[float, str]:

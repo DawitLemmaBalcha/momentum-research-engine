@@ -54,14 +54,14 @@ class BybitDemoConnector(BaseConnector):
 
         # Define precision (e.g., 5 decimal places for BTC).
         # This should be dynamic or a config lookup in a real system.
-        precision = 5 
+        precision = 3
         factor = 10 ** precision
 
         # We use math.floor to round DOWN to the nearest valid precision
         rounded_qty = math.floor(qty * factor) / factor
 
         # Convert the correctly rounded float to a string
-        qty_str = str(rounded_qty)
+        qty_str = f"{rounded_qty:.{precision}f}"
 
         self.logger.info(f"PLACING MAINNET DEMO ORDER: {side_bybit} {qty} {symbol_bybit}")
         
@@ -76,7 +76,7 @@ class BybitDemoConnector(BaseConnector):
             
             if response and response.get('retCode') == 0:
                 order_id = response['result']['orderId']
-                time.sleep(0.5) # Allow time for the market order to fill
+                time.sleep(2) # Allow time for the market order to fill
                 
                 trade_history = self.session.get_order_history(category="linear", orderId=order_id, limit=1)
                 
