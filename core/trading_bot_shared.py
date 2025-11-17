@@ -105,29 +105,36 @@ class MomentumAnchorBotShared(MomentumAnchorBotBase):
                     }
                     
                     self.execute_pyramid_entry(order, size, details, atr)
-                    self.pending_anchor_signals.remove(order) 
+
+                    # Check the return value of the execution
+                    trade_successful = self.execute_pyramid_entry(order, size, details, atr)
+
+                    # Only remove the anchor if the trade was successfully placed
+                    if trade_successful:
+                        self.pending_anchor_signals.remove(order)
+
                 
-                # --- ** LOG REJECTIONS ** ---
                 else:
+                    # --- START FIX ---
                     reasons = []
                     if not rsi_ok: reasons.append(f"RSI FAILED ({rsi_1m:.1f})")
                     if not macd_ok: reasons.append(f"MACD FAILED ({macd_1m:.2f})")
-                    
+
                     vol_confirm_factor = getattr(self.config, 'VOLUME_CONFIRMATION_FACTOR', 1.0)
                     if not volume_ok: reasons.append(f"VOLUME FAILED ({volume_1m:,.0f} < {volume_ma_1m * vol_confirm_factor:,.0f})")
-                    
-                    # Only log if it's not silent AND there are reasons to log
-                    if not self.silent and reasons:
+
+                    rejection_string = ", ".join(reasons)
+
+                    # Only log if the rejection reason is new
+                    if not self.silent and rejection_string and rejection_string != order.last_rejection_reason:
                         self.logger.info(
                             f"🚫 [ENTRY_REJECTED] | "
                             f"Anchor price {order.price:,.2f} hit for {order.order_type}. "
-                            f"Reason(s): {', '.join(reasons)}"
+                            f"Reason(s): {rejection_string}"
                         )
-                    
-                    # --- ** THE FIX: DO NOT REMOVE THE ORDER ** ---
-                    # The line 'self.pending_anchor_signals.remove(order)' has been deleted from here.
-                    # The order must remain active to be checked again on the next tick.
-                # --- ** END FIX ** ---
+
+                    # Update the last known reason
+                    order.last_rejection_reason = rejection_string
 
 
     def calculate_position_size(self, price: float, return_details: bool = False) -> float | Tuple[float, str]:

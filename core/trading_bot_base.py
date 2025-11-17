@@ -229,7 +229,7 @@ class MomentumAnchorBotBase(ABC):
         if len(self.open_positions) >= self.config.MAX_POSITIONS or amount <= 0: 
             if amount <= 0 and not self.silent:
                 self.logger.info(f"{current_time_str} - ⏩ Skipping trade. Calculated size is {amount:.5f}.")
-            return
+            return False
         
         direction = 'LONG' if order.order_type == 'buy' else 'SHORT'
         if not self.silent: self.logger.info(f"{current_time_str} - 📲 Attempting to place order via connector: {order.order_type} {amount:.5f} {self.symbol}")
@@ -237,7 +237,7 @@ class MomentumAnchorBotBase(ABC):
         result = self.connector.place_order(symbol=self.symbol, side=order.order_type, order_type="Market", qty=amount, price=order.price)
         if not result or not result.get("success"):
             if not self.silent: self.logger.error(f"{current_time_str} - ❌ Connector failed to place order.")
-            return
+            return False
 
         self.total_anchors_triggered += 1
         self.trades_since_anchor_reset += 1
@@ -264,6 +264,7 @@ class MomentumAnchorBotBase(ABC):
                             f"    - RSI ({confirmation_details['rsi_val']:.2f} {'>' if direction == 'LONG' else '<'} {confirmation_details['rsi_req']}) -> [{'✅' if confirmation_details['rsi_ok'] else '❌'}]\n"
                             f"    - MACD ({confirmation_details['macd_val']:.2f} {'> 0' if direction == 'LONG' else '< 0'}) -> [{'✅' if confirmation_details['macd_ok'] else '❌'}]\n"
                             f"    - Volume ({confirmation_details['volume_val']:,.2f} > {confirmation_details['volume_req']:,.2f}) -> [{'✅' if confirmation_details['volume_ok'] else '❌'}]")
+        return True
 
     
     def update_risk_parameters(self, log_status: bool = False):

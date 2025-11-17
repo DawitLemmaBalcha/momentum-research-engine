@@ -49,8 +49,8 @@ class Position:
 class Order:
     def __init__(self, price: float, order_type: str):
         self.price = price
-        # --- MODIFIED: amount has been removed ---
         self.order_type = order_type
+        self.last_rejection_reason = ""
 
 # ... (keep the SimulationClock class the same)
 

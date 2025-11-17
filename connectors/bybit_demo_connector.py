@@ -6,6 +6,7 @@ from pybit.unified_trading import HTTP, WebSocket
 from .base_connector import BaseConnector
 from typing import Dict, Any, Callable, List
 from core.core_types import Tick, Position
+import math
 
 class BybitDemoConnector(BaseConnector):
     """
@@ -51,6 +52,17 @@ class BybitDemoConnector(BaseConnector):
         side_bybit = "Buy" if side == "buy" else "Sell"
         symbol_bybit = symbol.replace('/', '')
 
+        # Define precision (e.g., 5 decimal places for BTC).
+        # This should be dynamic or a config lookup in a real system.
+        precision = 5 
+        factor = 10 ** precision
+
+        # We use math.floor to round DOWN to the nearest valid precision
+        rounded_qty = math.floor(qty * factor) / factor
+
+        # Convert the correctly rounded float to a string
+        qty_str = str(rounded_qty)
+
         self.logger.info(f"PLACING MAINNET DEMO ORDER: {side_bybit} {qty} {symbol_bybit}")
         
         try:
@@ -59,7 +71,7 @@ class BybitDemoConnector(BaseConnector):
                 symbol=symbol_bybit,
                 side=side_bybit,
                 orderType="Market",
-                qty=str(qty),
+                qty=qty_str,
             )
             
             if response and response.get('retCode') == 0:
