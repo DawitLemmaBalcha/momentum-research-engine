@@ -1,4 +1,4 @@
-# backtest_runner.py
+# simulation/backtest_runner.py
 
 import pandas as pd
 import numpy as np
@@ -292,13 +292,18 @@ def run_simulation_from_prepared_data(
     portfolio_results, individual_results = engine.run(trial=trial)
     final_metrics = individual_results[0] if individual_results else {}
     
-    # --- ADDED: Merge correct drawdown from portfolio results into final metrics ---
+    # --- MERGE CORRECT DRAWDOWN FROM PORTFOLIO RESULTS ---
     if final_metrics and portfolio_results:
         final_metrics['max_drawdown'] = portfolio_results.get('max_drawdown', 0.0)
         final_metrics['realized_max_drawdown'] = portfolio_results.get('realized_max_drawdown', 0.0)
         # We must also re-generate the log string so it contains the correct values
         final_metrics['performance_log_str'] = bot._get_performance_log_str(final_metrics)
-    # --- END ADDED ---
+    # --- END MERGE ---
+
+    # --- [NEW] ATTACH EQUITY CURVE FOR OPTIMIZER EFFICIENCY ---
+    if engine.portfolio_equity_curve:
+        final_metrics['equity_curve'] = engine.portfolio_equity_curve
+    # --- END NEW ---
 
     if verbose and logger and final_metrics:
         logger.info(final_metrics.get("performance_log_str", "Performance log not available."))

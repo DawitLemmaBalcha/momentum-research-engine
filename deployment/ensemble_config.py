@@ -48,12 +48,15 @@ VENUES = {
         "strategies": [
             "strategies/cluster_1_1.py",
             "strategies/cluster_1_2.py",
-            "strategies/cluster_2_1.py",
-            "strategies/cluster_2_2.py",
-            "strategies/cluster_3_1.py",
-            "strategies/cluster_3_2.py",
-            "strategies/cluster_4_1.py",
-            "strategies/cluster_4_2.py" 
+            #"strategies/cluster_2_1.py",
+            #"strategies/cluster_2_2.py",
+            #"strategies/cluster_3_1.py",
+            #"strategies/cluster_3_2.py",
+            #"strategies/cluster_4_1.py",
+            #"strategies/cluster_4_2.py",
+            #"strategies/cluster_4_3.py",
+            #"strategies/cluster_4_4.py",
+            #"strategies/cluster_4_5.py" 
         ]
     },
     

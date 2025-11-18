@@ -43,6 +43,8 @@ def create_wide_objective_function():
     """
     Creates a tailored objective function for Optuna with wide parameter ranges
     to allow the optimizer to explore a large landscape.
+    
+    [NEW] Also stores the equity curve in the trial to avoid re-simulation.
     """
     # --- MODIFIED: Accepts df_static_prepared ---
     def wide_objective(trial, df_static_prepared: pd.DataFrame, opt_logger):
@@ -83,6 +85,12 @@ def create_wide_objective_function():
 
             if not performance_metrics: return -1.0
             
+            # --- [NEW] SAVE EQUITY CURVE TO TRIAL ---
+            # We extract it here so we don't need to simulate again later during clustering.
+            equity_curve = performance_metrics.pop("equity_curve", [])
+            trial.set_user_attr("equity_curve", equity_curve)
+            # ----------------------------------------
+            
             trial.set_user_attr("performance", performance_metrics)
             return performance_metrics.get("sortino_ratio", -1.0)
         
@@ -95,82 +103,38 @@ def create_wide_objective_function():
     return wide_objective
 # --- END MODIFIED ---
 
-# --- *** NEW HELPER FUNCTION *** ---
-def get_resampled_equity_curve(trial: optuna.Trial, df_static_prepared: pd.DataFrame, base_config, logger) -> np.ndarray:
+# --- [NEW] Helper to process stored curve without re-running sim ---
+def process_stored_equity_curve(equity_tuples) -> np.ndarray:
     """
-    Runs a full Model A backtest for a given trial and returns
-    its daily-resampled, mean-normalized equity curve.
+    Converts a list of (timestamp, equity) tuples into a 
+    daily-resampled, mean-normalized numpy array for clustering.
     """
-    try:
-        # 1. Create the bot's config from the trial
-        trial_config = ConfigContainer()
-        for attr in dir(base_config):
-            if attr.isupper():
-                setattr(trial_config, attr, getattr(base_config, attr))
-        
-        for key, value in trial.params.items():
-            setattr(trial_config, key, value)
-        
-        trial_config.ATR_TRAILING_STOP_MULTIPLIER = trial_config.ATR_TRAILING_STOP_ACTIVATION_MULTIPLIER * trial_config.TRAILING_RATIO
-
-        # 2. Prepare this trial's specific data
-        df_trial_prepared = add_dynamic_indicators(df_static_prepared, trial_config)
-        if df_trial_prepared.empty:
-            return None
-
-        # 3. Setup and run the Model A SimulationEngine
-        # We must use the Model A bot and engine to get the isolated curve
-        bot = ModelABot(
-            initial_capital=trial_config.INITIAL_CAPITAL,
-            simulation_clock=SimulationClock(0), 
-            config_module=trial_config,
-            connector=None, # DummyConnector will be set by engine
-            silent=True
-        )
-        engine = ModelAEngine(df_trial_prepared, [bot], logger, prepared=True)
-        
-        # Run and get the *1-minute* equity curve
-        # This is the list of (timestamp, capital) tuples
-        portfolio_results, _ = engine.run()
-        equity_tuples = engine.portfolio_equity_curve
-
-        if not portfolio_results or not equity_tuples:
-            return None
-
-        # 4. Resample the 1-minute curve to Daily
-        equity_series = pd.Series(
-            [val for ts, val in equity_tuples],
-            index=pd.to_datetime([ts for ts, val in equity_tuples], unit='s')
-        )
-        
-        # Resample to daily, getting the last value of each day
-        # and forward-filling weekends/holidays
-        daily_equity_series = equity_series.resample('D').last().ffill()
-
-        # 5. Normalize for clustering
-        # We normalize by the mean. This keeps the shape but removes
-        # the magnitude (e.g., 20% return vs 30% return).
-        # We cluster on SHAPE, not on total P&L.
-        # Handle potential zero-mean (flat curve)
-        mean_val = daily_equity_series.mean()
-        if mean_val == 0:
-            return daily_equity_series.values # Return as-is
-            
-        normalized_curve = daily_equity_series.values / mean_val
-
-        return normalized_curve
-
-    except Exception as e:
-        logger.error(f"Failed to generate equity curve for trial {trial.number}: {e}", exc_info=False)
+    if not equity_tuples:
         return None
-# --- *** END NEW HELPER FUNCTION *** ---
-
+        
+    equity_series = pd.Series(
+        [val for ts, val in equity_tuples],
+        index=pd.to_datetime([ts for ts, val in equity_tuples], unit='s')
+    )
+    
+    # Resample to Daily (taking last value of the day)
+    daily_equity_series = equity_series.resample('D').last().ffill()
+    
+    # Normalize by mean
+    mean_val = daily_equity_series.mean()
+    if mean_val == 0:
+        return daily_equity_series.values
+        
+    return daily_equity_series.values / mean_val
+# --- END NEW ---
 
 # --- *** MODIFIED: Main walk function *** ---
 def run_ensemble_walk(walk_number: int, is_start: str, is_end: str, oos_end: str, n_trials: int, n_clusters: int, top_n_per_cluster: int, opt_logger):
     """
     Executes a full walk-forward cycle with a single wide optimization
     and K-Means clustering for diverse ensemble selection.
+    
+    [NEW] Supports Persistent Storage (SQLite) to resume optimization mid-walk.
     """
     opt_logger.info(f"--- Starting Walk #{walk_number} | IS: {is_start} to {is_end} | OOS: {is_end} to {oos_end} ---")
 
@@ -200,19 +164,45 @@ def run_ensemble_walk(walk_number: int, is_start: str, is_end: str, oos_end: str
         opt_logger.error(f"Failed to fetch or slice data: {e}", exc_info=True)
         return
 
-    # 2. --- Run ONE Single, Wide Optimization ---
+    # 2. --- Run ONE Single, Wide Optimization (PERSISTENT) ---
     optuna.logging.set_verbosity(optuna.logging.ERROR)
     
-    opt_logger.info(f"--- Running WIDE optimization ({n_trials} trials)... ---")
-    objective_func = create_wide_objective_function()
-    study = optuna.create_study(direction="maximize")
+    # --- [NEW] PERSISTENT STORAGE SETUP ---
+    db_path = f"results/walk_{walk_number}_optimization.db"
+    storage_url = f"sqlite:///{db_path}"
+    study_name = f"walk_{walk_number}_study"
     
-    study.optimize(
-        lambda trial: objective_func(trial, df_is_static_prepared, opt_logger), # <-- Use static IS data
-        n_trials=n_trials, 
-        n_jobs=-1, 
-        show_progress_bar=True
+    opt_logger.info(f"--- Connecting to Optimization Database: {db_path} ---")
+    
+    # Create/Load study with persistent storage
+    study = optuna.create_study(
+        study_name=study_name,
+        storage=storage_url,
+        direction="maximize",
+        load_if_exists=True # <-- Crucial for resuming
     )
+    
+    # Check progress
+    completed_trials_count = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
+    trials_remaining = n_trials - completed_trials_count
+    
+    if trials_remaining > 0:
+        opt_logger.info(f"--- Running Optimization: {completed_trials_count} completed, {trials_remaining} to go... ---")
+        
+        objective_func = create_wide_objective_function()
+        
+        try:
+            study.optimize(
+                lambda trial: objective_func(trial, df_is_static_prepared, opt_logger), 
+                n_trials=trials_remaining, 
+                n_jobs=-1, 
+                show_progress_bar=True
+            )
+        except KeyboardInterrupt:
+            opt_logger.warning("Optimization interrupted by user! Progress saved to DB.")
+            return # Exit gracefully so data isn't corrupted
+    else:
+        opt_logger.info(f"--- Optimization already complete ({completed_trials_count} trials found). Skipping to Clustering... ---")
 
     # 3. --- Filter, Cluster, and Select Top Performers ---
     completed_trials = []
@@ -229,24 +219,20 @@ def run_ensemble_walk(walk_number: int, is_start: str, is_end: str, oos_end: str
 
     # --- *** MODIFIED: Replaced parameter KMeans with DTW Equity Curve Clustering *** ---
     
-    opt_logger.info(f"Generating equity curves for {len(completed_trials)} winning trials...")
+    opt_logger.info(f"Processing equity curves for {len(completed_trials)} winning trials (Using STORED data)...")
     
     equity_curves = []
     valid_trials_for_clustering = []
 
-    # 1. Generate resampled equity curves for all winners
+    # --- [MODIFIED] Use stored curves instead of re-running ---
     for trial in completed_trials:
-        # We use df_is_static_prepared (In-Sample data) for clustering
-        daily_curve = get_resampled_equity_curve(
-            trial, 
-            df_is_static_prepared, # <-- Use In-Sample data
-            config, 
-            opt_logger
-        )
+        raw_curve = trial.user_attrs.get("equity_curve", [])
+        daily_curve = process_stored_equity_curve(raw_curve)
         
         if daily_curve is not None:
             equity_curves.append(daily_curve)
             valid_trials_for_clustering.append(trial)
+    # ---------------------------------------------------------
 
     if len(equity_curves) < n_clusters:
         opt_logger.warning(f"Only {len(equity_curves)} valid equity curves generated, which is less than {n_clusters} clusters. Using all valid trials.")
@@ -393,7 +379,8 @@ def run_ensemble_walk(walk_number: int, is_start: str, is_end: str, oos_end: str
         'pnl_cash': total_pnl,
         'total_return_pct': total_return_pct,
         'max_drawdown': avg_max_drawdown, # Mark as average
-        'realized_max_drawdown': avg_realized_drawdown # Mark as average
+        'realized_max_drawdown': avg_realized_drawdown, # Mark as average
+        'walk': walk_number
     }
     
     opt_logger.info(f"  --- Portfolio Summary (Sum of all bots) ---")
@@ -420,7 +407,6 @@ def run_ensemble_walk(walk_number: int, is_start: str, is_end: str, oos_end: str
     
     opt_logger.info("="*87 + "\n")
 
-    portfolio_results['walk'] = walk_number
     all_walks_data.append(portfolio_results)
 
 
@@ -428,6 +414,9 @@ if __name__ == "__main__":
     for env_var in ['OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS', 'VECLIB_MAXIMUM_THREADS', 'NUMEXPR_NUM_THREADS']:
         os.environ[env_var] = '1'
     
+    # Ensure results directory exists
+    os.makedirs("results", exist_ok=True)
+
     log_filename = f"logs/walk_forward_ensemble_log_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log"
     main_logger = logging.getLogger('wf_ensemble_logger')
     main_logger.setLevel(logging.INFO)
@@ -440,8 +429,8 @@ if __name__ == "__main__":
     
     walk_forward_schedule = [
         {'is_start': '2025-01-01 00:00:00', 'is_end': '2025-06-01 00:00:00', 'oos_end': '2025-09-01 00:00:00'},
-        #{'is_start': '2024-09-01 00:00:00', 'is_end': '2024-12-01 00:00:00', 'oos_end': '2025-01-01 00:00:00'},
-        #{'is_start': '2024-10-01 00:00:00', 'is_end': '2025-01-01 00:00:00', 'oos_end': '2025-02-01 00:00:00'},
+        {'is_start': '2025-02-01 00:00:00', 'is_end': '2025-07-01 00:00:00', 'oos_end': '2025-10-01 00:00:00'},
+        {'is_start': '2025-03-01 00:00:00', 'is_end': '2025-08-01 00:00:00', 'oos_end': '2025-10-01 00:00:00'},
         #{'is_start': '2024-11-01 00:00:00', 'is_end': '2025-02-01 00:00:00', 'oos_end': '2025-03-01 00:00:00'},
         #{'is_start': '2024-12-01 00:00:00', 'is_end': '2025-03-01 00:00:00', 'oos_end': '2025-04-01 00:00:00'},
         #{'is_start': '2025-01-01 00:00:00', 'is_end': '2025-04-01 00:00:00', 'oos_end': '2025-05-01 00:00:00'},
@@ -451,13 +440,31 @@ if __name__ == "__main__":
         #{'is_start': '2025-05-01 00:00:00', 'is_end': '2025-08-01 00:00:00', 'oos_end': '2025-09-01 00:00:00'},
     ]
     
-    trials_per_optimization_walk = 500 
+    trials_per_optimization_walk = 150 
     number_of_clusters = 3           
     top_n_per_cluster = 3              
 
-    main_logger.info("--- Starting Full Walk-Forward Ensemble Analysis (with K-Means Clustering) ---")
+    main_logger.info("--- Starting Full Walk-Forward Ensemble Analysis (Resume-Capable) ---")
     for i, walk_dates in enumerate(walk_forward_schedule):
         walk_num = i + 1
+        walk_filename = f"results/walk_{walk_num}_result.csv"
+        
+        # --- [NEW] CHECK FOR EXISTING RESULT (RESUME LOGIC) ---
+        if os.path.exists(walk_filename):
+            main_logger.info(f">>> Walk {walk_num} already completed (Found {walk_filename}). Skipping...")
+            
+            # Load result to include in final aggregate
+            try:
+                existing_df = pd.read_csv(walk_filename)
+                if not existing_df.empty:
+                    all_walks_data.append(existing_df.to_dict(orient='records')[0])
+            except Exception as e:
+                main_logger.error(f"Failed to load existing result for Walk {walk_num}: {e}")
+            continue 
+        # ------------------------------------------------------
+
+        main_logger.info(f"\n>>> PROCESSING WALK {walk_num}...")
+        
         run_ensemble_walk(
             walk_number=walk_num,
             is_start=walk_dates['is_start'],
@@ -468,11 +475,21 @@ if __name__ == "__main__":
             top_n_per_cluster=top_n_per_cluster,
             opt_logger=main_logger
         )
+
+        # --- [NEW] SAVE INCREMENTAL RESULT ---
+        # Since run_ensemble_walk appends to all_walks_data, we grab the last one
+        if all_walks_data and all_walks_data[-1].get('walk') == walk_num:
+            latest_result = all_walks_data[-1]
+            pd.DataFrame([latest_result]).to_csv(walk_filename, index=False)
+            main_logger.info(f">>> Saved Walk {walk_num} result to {walk_filename}")
+        else:
+            main_logger.warning(f"Walk {walk_num} finished but no result data was found to save.")
+        # -------------------------------------
+
     main_logger.info("\n--- All Walk-Forward Ensemble Analysis runs are complete. ---")
 
     if all_walks_data:
         results_df = pd.DataFrame(all_walks_data)
-        results_filename = f"results/walk_forward_ensemble_results_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
-        os.makedirs("results", exist_ok=True)
+        results_filename = f"results/walk_forward_ensemble_results_FINAL_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
         results_df.to_csv(results_filename, index=False)
         main_logger.info(f"\nSuccessfully saved all walk-forward ensemble data to: {results_filename}")
