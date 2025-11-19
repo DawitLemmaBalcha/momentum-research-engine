@@ -46,3 +46,4 @@ seaborn
 scikit-learn
 numba
 tslearn
+psycopg2-binary

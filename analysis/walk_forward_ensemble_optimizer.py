@@ -85,11 +85,31 @@ def create_wide_objective_function():
 
             if not performance_metrics: return -1.0
             
-            # --- [NEW] SAVE EQUITY CURVE TO TRIAL ---
-            # We extract it here so we don't need to simulate again later during clustering.
-            equity_curve = performance_metrics.pop("equity_curve", [])
-            trial.set_user_attr("equity_curve", equity_curve)
-            # ----------------------------------------
+            # --- [FIX] OPTIMIZED EQUITY CURVE STORAGE ---
+            # The raw 1-minute curve is too large for DB storage and causes 'max length' errors.
+            # We resample it to 'Daily' resolution here before saving.
+            raw_curve = performance_metrics.pop("equity_curve", [])
+            
+            if raw_curve:
+                # Convert to pandas for easy resampling
+                df_curve = pd.DataFrame(raw_curve, columns=['ts', 'equity'])
+                df_curve['dt'] = pd.to_datetime(df_curve['ts'], unit='s')
+                df_curve.set_index('dt', inplace=True)
+                
+                # Resample to Daily (taking the last value of each day)
+                daily_curve = df_curve['equity'].resample('D').last().dropna()
+                
+                # Convert back to lightweight list of tuples [(ts, val), ...]
+                # ensuring standard Python types (float) for JSON serialization
+                optimized_curve = [
+                    (float(ts.timestamp()), float(val)) 
+                    for ts, val in daily_curve.items()
+                ]
+                
+                trial.set_user_attr("equity_curve", optimized_curve)
+            else:
+                trial.set_user_attr("equity_curve", [])
+            # --------------------------------------------
             
             trial.set_user_attr("performance", performance_metrics)
             return performance_metrics.get("sortino_ratio", -1.0)
@@ -118,6 +138,8 @@ def process_stored_equity_curve(equity_tuples) -> np.ndarray:
     )
     
     # Resample to Daily (taking last value of the day)
+    # Note: Since we already resampled before saving, this is largely a pass-through check,
+    # but kept for safety/consistency.
     daily_equity_series = equity_series.resample('D').last().ffill()
     
     # Normalize by mean
@@ -134,7 +156,7 @@ def run_ensemble_walk(walk_number: int, is_start: str, is_end: str, oos_end: str
     Executes a full walk-forward cycle with a single wide optimization
     and K-Means clustering for diverse ensemble selection.
     
-    [NEW] Supports Persistent Storage (SQLite) to resume optimization mid-walk.
+    [NEW] Supports Persistent Storage (PostgreSQL) to resume optimization mid-walk.
     """
     opt_logger.info(f"--- Starting Walk #{walk_number} | IS: {is_start} to {is_end} | OOS: {is_end} to {oos_end} ---")
 
@@ -167,19 +189,22 @@ def run_ensemble_walk(walk_number: int, is_start: str, is_end: str, oos_end: str
     # 2. --- Run ONE Single, Wide Optimization (PERSISTENT) ---
     optuna.logging.set_verbosity(optuna.logging.ERROR)
     
-    # --- [NEW] PERSISTENT STORAGE SETUP ---
-    db_path = f"results/walk_{walk_number}_optimization.db"
-    storage_url = f"sqlite:///{db_path}"
+    # --- [FIX] PERSISTENT STORAGE SETUP (PostgreSQL) ---
+    # Using PostgreSQL allows concurrency (n_jobs=-1) without locking.
+    storage_url = "postgresql://myuser:mypassword@localhost/optuna_db"
     study_name = f"walk_{walk_number}_study"
     
-    opt_logger.info(f"--- Connecting to Optimization Database: {db_path} ---")
+    opt_logger.info(f"--- Connecting to Optimization Database: {storage_url} ---")
     
-    # Create/Load study with persistent storage
+    # --- [FIX] RELAXED PRUNING SETTINGS ---
+    # n_startup_trials=20: First 20 trials will NEVER be pruned (sets baseline)
+    # n_warmup_steps=40000: Trials won't be pruned until step 40,000 (gives strategies time to breathe)
     study = optuna.create_study(
         study_name=study_name,
         storage=storage_url,
         direction="maximize",
-        load_if_exists=True # <-- Crucial for resuming
+        load_if_exists=True, # <-- Crucial for resuming
+        pruner=optuna.pruners.MedianPruner(n_startup_trials=20, n_warmup_steps=40000)
     )
     
     # Check progress
@@ -187,7 +212,7 @@ def run_ensemble_walk(walk_number: int, is_start: str, is_end: str, oos_end: str
     trials_remaining = n_trials - completed_trials_count
     
     if trials_remaining > 0:
-        opt_logger.info(f"--- Running Optimization: {completed_trials_count} completed, {trials_remaining} to go... ---")
+        opt_logger.info(f"--- Resuming Optimization: {completed_trials_count} completed, {trials_remaining} to go... ---")
         
         objective_func = create_wide_objective_function()
         
@@ -440,7 +465,7 @@ if __name__ == "__main__":
         #{'is_start': '2025-05-01 00:00:00', 'is_end': '2025-08-01 00:00:00', 'oos_end': '2025-09-01 00:00:00'},
     ]
     
-    trials_per_optimization_walk = 150 
+    trials_per_optimization_walk = 500 
     number_of_clusters = 3           
     top_n_per_cluster = 3              
 
