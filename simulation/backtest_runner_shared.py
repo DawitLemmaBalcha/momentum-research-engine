@@ -279,6 +279,15 @@ class SimulationEngine:
                 # we immediately re-balance the capital allocations.
                 self._update_dynamic_allocations()
                 # --- ** End Fix ** ---
+
+            # --- *** NEW: 5-MINUTE RISK MANAGEMENT HEARTBEAT *** ---
+            # Matches the Live Engine's 5-minute update cycle
+            if current_row['timestamp'].minute % 5 == 0:
+                for bot in self.bots:
+                    bot.update_risk_parameters()
+                # Force re-allocation immediately after risk parameters change
+                self._update_dynamic_allocations()
+            # --- *** END NEW *** ---
             
             o, h, l, c, v, base_ts = current_row['open'], current_row['high'], current_row['low'], current_row['close'], current_row['volume'], current_row['timestamp'].timestamp()
             

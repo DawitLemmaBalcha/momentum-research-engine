@@ -7,7 +7,7 @@ project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta # <-- MODIFIED: Added timedelta for warmup buffer
 import pandas as pd
 import numpy as np
 import optuna
@@ -160,27 +160,51 @@ def run_ensemble_walk(walk_number: int, is_start: str, is_end: str, oos_end: str
     """
     opt_logger.info(f"--- Starting Walk #{walk_number} | IS: {is_start} to {is_end} | OOS: {is_end} to {oos_end} ---")
 
-    # 1. --- Fetch and slice data ---
-    config.START_DATE, config.END_DATE = is_start, oos_end
+    # 1. --- Fetch and slice data (WITH WARMUP BUFFER FIX) ---
+    
+    # --- FIX: Add 7-day buffer to prime indicators ---
+    warmup_days = 7
+    is_start_dt = pd.to_datetime(is_start)
+    warmup_start_dt = is_start_dt - timedelta(days=warmup_days)
+    
+    config.START_DATE = warmup_start_dt.strftime('%Y-%m-%d %H:%M:%S')
+    config.END_DATE = oos_end
+    
+    opt_logger.info(f"Fetching data with {warmup_days}-day warmup buffer (Start: {config.START_DATE})...")
+    # --- END FIX ---
+
     try:
         _, df_full, _ = fetch_all_dataframes()
-        df_is_raw = df_full[(df_full['timestamp'] >= pd.to_datetime(is_start)) & (df_full['timestamp'] < pd.to_datetime(is_end))].copy()
-        df_oos_raw = df_full[(df_full['timestamp'] >= pd.to_datetime(is_end)) & (df_full['timestamp'] < pd.to_datetime(oos_end))].copy()
-        if df_is_raw.empty or df_oos_raw.empty:
-            opt_logger.warning("Skipping walk due to empty in-sample or out-of-sample data.")
+        
+        # --- FIX: Prepare Data on FULL set, then slice ---
+        if df_full.empty:
+            opt_logger.warning("Skipping walk due to empty data fetch.")
             return
             
-        # --- NEW: Prepare static data ONCE for IS and OOS ---
-        opt_logger.info(f"Preparing {len(df_is_raw)} IS records (static)...")
-        df_is_static_prepared = prepare_static_data(df_is_raw, config)
+        opt_logger.info(f"Preparing static indicators for full range ({len(df_full)} rows)...")
+        df_full_static_prepared = prepare_static_data(df_full, config)
         
-        opt_logger.info(f"Preparing {len(df_oos_raw)} OOS records (static)...")
-        df_oos_static_prepared = prepare_static_data(df_oos_raw, config)
+        if df_full_static_prepared.empty:
+             opt_logger.warning("Prepared data is empty.")
+             return
+
+        # Slice IS and OOS *after* preparation to ensure valid data at boundaries
+        df_is_static_prepared = df_full_static_prepared[
+            (df_full_static_prepared['timestamp'] >= is_start_dt) & 
+            (df_full_static_prepared['timestamp'] < pd.to_datetime(is_end))
+        ].copy()
+        
+        df_oos_static_prepared = df_full_static_prepared[
+            (df_full_static_prepared['timestamp'] >= pd.to_datetime(is_end)) & 
+            (df_full_static_prepared['timestamp'] < pd.to_datetime(oos_end))
+        ].copy()
+        
+        opt_logger.info(f"Data Ready: IS Records={len(df_is_static_prepared)} | OOS Records={len(df_oos_static_prepared)}")
         
         if df_is_static_prepared.empty or df_oos_static_prepared.empty:
-            opt_logger.warning("Skipping walk due to empty prepared data (IS or OOS).")
+            opt_logger.warning("Skipping walk due to empty IS or OOS slices after preparation.")
             return
-        # --- END NEW ---
+        # --- END FIX ---
             
     except Exception as e:
         opt_logger.error(f"Failed to fetch or slice data: {e}", exc_info=True)

@@ -148,6 +148,13 @@ class SimulationEngine:
             if current_row['timestamp'].floor('30min') > prev_row['timestamp'].floor('30min'):
                 for bot in self.bots:
                     bot.update_strategy_on_30m(prev_row.to_dict())
+
+            # --- *** NEW: 5-MINUTE RISK MANAGEMENT HEARTBEAT *** ---
+            # Matches the Live Engine's 5-minute update cycle
+            if current_row['timestamp'].minute % 5 == 0:
+                for bot in self.bots:
+                    bot.update_risk_parameters()
+            # --- *** END NEW *** ---
             
             o, h, l, c, v, base_ts = current_row['open'], current_row['high'], current_row['low'], current_row['close'], current_row['volume'], current_row['timestamp'].timestamp()
             

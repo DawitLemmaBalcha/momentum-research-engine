@@ -13,78 +13,53 @@ from connectors.base_connector import BaseConnector
 
 default_logger = logging.getLogger(__name__)
 
-# Helper function for timestamp formatting
 def format_time(timestamp: float) -> str:
     return pd.to_datetime(timestamp, unit='s').strftime('%Y-%m-%d %H:%M:%S')
 
 class MomentumAnchorBotBase(ABC):
     """
     Abstract Base Class for the Trend-Anchored, Momentum-Confirmed Bot.
-    Contains shared logic for both Model A (standalone) and Model C (shared portfolio).
     """
     def __init__(self, initial_capital: float, simulation_clock: SimulationClock, config_module, connector: BaseConnector, silent: bool = False):
         self.config = config_module
-        
         self.logger = default_logger
-
-        # --- Common Properties ---
         self.initial_capital = initial_capital
         self.clock = simulation_clock
         self.connector = connector
         self.silent = silent
         self.symbol = self.config.SYMBOL
         self.open_positions, self.pending_anchor_signals, self.trade_history = [], [], []
-        
-        # --- State Properties (will be managed differently by children) ---
         self.capital = initial_capital
         self.peak_capital = initial_capital
         self.unrealized_pnl = 0.0
         self.realized_equity_curve = [(self.clock.time(), initial_capital)]
         self.max_drawdown = 0.0
-
-        # --- Strategy/Risk Parameters ---
         self.kelly_fraction = self.config.KELLY_FRACTION
         self.max_position_size = self.config.MAX_POSITION_SIZE_PERCENT
         self.PYRAMID_SCALING_FACTOR = getattr(self.config, 'PYRAMID_SCALING_FACTOR', 1.0) 
         self.trades_since_anchor_reset = 0
         self.last_anchor_setup_time = 0
-        self.anchor_step_size = 0.01 # This is the % step (formerly grid_size)
+        self.anchor_step_size = 0.01
         self.trend_regime = "uninitialized"
-
-        # This will store the bot's current risk level (1.0 = 100%)
         self.sizing_multiplier = 1.0
-        
-        # --- Stats ---
         self.total_anchors_set = 0
         self.total_anchors_triggered = 0
-        
-        # --- Model C Specific (ignored by Model A) ---
-        self.portfolio_initial_capital = initial_capital # Will be overwritten by Model C engine
-        self.capital_allocation = 1.0 # Will be overwritten by Model C engine
+        self.portfolio_initial_capital = initial_capital
+        self.capital_allocation = 1.0
 
-    # --- Abstract Methods (Must be implemented by child classes) ---
-    
     @abstractmethod
     def calculate_position_size(self, price: float, return_details: bool = False) -> float | Tuple[float, str]:
-        """Calculates position size based on the bot's capital model (A or C)."""
         pass
 
     @abstractmethod
     def close_position(self, position: Position, current_price: float, reason: str):
-        """Closes a position and updates capital based on the bot's model (A or C)."""
         pass
 
-    # --- Common Methods (Shared by all bot models) ---
-
     def initialize_state(self, initial_data_row: dict):
-        """Sets up the bot's initial state from the first row of data."""
         self.trend_regime = self._get_trend_regime(initial_data_row)
         self.setup_asymmetric_anchors("Initial Setup", initial_data_row)
 
     def _get_trend_regime(self, data_row: dict) -> str:
-        """Determines the current market trend and regime."""
-        # This version dynamically looks up indicators to work with BOTH
-        # Model A (e.g., 'short_ema') and Model C (e.g., 'short_ema_10')
         c = self.config
         try:
             short_ma = data_row.get(f'short_ema_{c.SHORT_EMA_PERIOD}', data_row.get('short_ema'))
@@ -97,7 +72,7 @@ class MomentumAnchorBotBase(ABC):
             
             if any(v is None for v in [short_ma, long_ma, rsi, macd, bb_upper, bb_lower]):
                 return "neutral"
-        except KeyError as e:
+        except KeyError:
             return "neutral"
 
         trend = "neutral"
@@ -112,21 +87,17 @@ class MomentumAnchorBotBase(ABC):
         return f"{trend}_{regime}"
 
     def setup_asymmetric_anchors(self, reason: str, data_row: dict):
-        """Builds or rebuilds the asymmetric anchor signals."""
         current_time = self.clock.time()
         current_time_str = format_time(current_time)
         if current_time - self.last_anchor_setup_time < getattr(self.config, 'ANCHOR_SETUP_COOLDOWN_SECONDS', 1800): return
         
-        # This version dynamically looks up indicators
         c = self.config
         try:
             current_price = data_row['close']
             bb_upper = data_row.get(f'bb_upper_{c.BOLLINGER_PERIOD}_{c.BOLLINGER_STD_DEV}', data_row.get('bb_upper'))
             bb_lower = data_row.get(f'bb_lower_{c.BOLLINGER_PERIOD}_{c.BOLLINGER_STD_DEV}', data_row.get('bb_lower'))
-            if bb_upper is None or bb_lower is None:
-                return # Can't set up anchors
-        except KeyError:
-            return # Can't set up anchors
+            if bb_upper is None or bb_lower is None: return 
+        except KeyError: return 
 
         self.pending_anchor_signals.clear() 
         self.trades_since_anchor_reset = 0
@@ -136,9 +107,8 @@ class MomentumAnchorBotBase(ABC):
         self.anchor_step_size = max(self.config.ANCHOR_STEP_MIN_PERCENT, min(bb_width * getattr(self.config, 'ANCHOR_BAND_MULTIPLIER', 0.5), self.config.ANCHOR_STEP_MAX_PERCENT))
         
         total_anchors = self.config.NUM_ANCHORS
-        if "ranging" in self.trend_regime: total_anchors = 2 # Always set 1 buy/1 sell in ranging
+        if "ranging" in self.trend_regime: total_anchors = 2 
         
-        # Use config names that reflect the pyramid/anchor strategy
         ratio_normal = getattr(self.config, 'TREND_PYRAMID_RATIO_NORMAL', 0.6)
         ratio_strong = getattr(self.config, 'TREND_PYRAMID_RATIO_STRONG', 0.8)
         
@@ -153,18 +123,15 @@ class MomentumAnchorBotBase(ABC):
             price = current_price * (1 + i * self.anchor_step_size)
             new_signal = Order(price, "buy")
             new_anchor_signals.append(new_signal)
-            if not self.silent:
-                self.logger.info(f"{current_time_str} - Signals ➡️ Created internal anchor signal: buy @ {new_signal.price:,.2f}")
+            if not self.silent: self.logger.info(f"{current_time_str} - Signals ➡️ Created internal anchor signal: buy @ {new_signal.price:,.2f}")
         for i in range(1, sell_anchors + 1):
             price = current_price * (1 - i * self.anchor_step_size)
             new_signal = Order(price, "sell")
             new_anchor_signals.append(new_signal)
-            if not self.silent:
-                self.logger.info(f"{current_time_str} - Signals ⬅️ Created internal anchor signal: sell @ {new_signal.price:,.2f}")
+            if not self.silent: self.logger.info(f"{current_time_str} - Signals ⬅️ Created internal anchor signal: sell @ {new_signal.price:,.2f}")
 
         self.pending_anchor_signals = new_anchor_signals 
-        if self.pending_anchor_signals: 
-            self.total_anchors_set += len(self.pending_anchor_signals)
+        if self.pending_anchor_signals: self.total_anchors_set += len(self.pending_anchor_signals)
 
         if not self.silent:
             buy_anchors_list = [o for o in self.pending_anchor_signals if o.order_type == 'buy']
@@ -179,7 +146,6 @@ class MomentumAnchorBotBase(ABC):
         self.last_anchor_setup_time = current_time
 
     def check_exits_on_1m(self, current_price: float, atr: float):
-        """Checks and manages exits for all open positions."""
         current_time = self.clock.time()
         current_time_str = format_time(current_time) 
         for position in self.open_positions[:]:
@@ -207,23 +173,18 @@ class MomentumAnchorBotBase(ABC):
                     position.peak_price = min(position.peak_price, current_price)
                     new_stop = min(position.stop_loss, position.peak_price + trailing_distance)
                 
-                # --- NEW EMOJI LOGIC ---
                 if new_stop != position.stop_loss:
                     if not self.silent: self.logger.info(f"{current_time_str} - 🔒 Trailing SL moved to {new_stop:,.2f} for position {position.id}")
-                # --- END NEW EMOJI LOGIC ---
                 position.stop_loss = new_stop
 
 
             if position.stop_loss is not None and ((position.is_long and current_price <= position.stop_loss) or (not position.is_long and current_price >= position.stop_loss)):
-                # --- NEW EMOJI LOGIC ---
                 exit_reason = "Trail Stop" if position.is_trailing_active else "ATR Stop"
-                emoji = "🟢" if position.is_trailing_active else "🛑" # Green check for profit stop, red for loss stop
+                emoji = "🟢" if position.is_trailing_active else "🛑" 
                 if not self.silent: self.logger.info(f"{current_time_str} - {emoji} Triggering {exit_reason} for position {position.id} at price {current_price:,.2f} (Stop: {position.stop_loss:,.2f})")
-                # --- END NEW EMOJI LOGIC ---
                 self.close_position(position, current_price, exit_reason)
 
     def execute_pyramid_entry(self, order: Order, amount: float, confirmation_details: dict, atr: float):
-        """Executes a single pyramid trade via the connector and logs it."""
         current_time_str = format_time(self.clock.time()) 
         
         if len(self.open_positions) >= self.config.MAX_POSITIONS or amount <= 0: 
@@ -243,9 +204,19 @@ class MomentumAnchorBotBase(ABC):
         self.trades_since_anchor_reset += 1
 
         entry_price = result['entry_price']
-        new_position = Position(entry_price, amount, direction == 'LONG')
+        
+        # --- FIX: Use the actual filled quantity from the connector if available ---
+        # This prevents the "Qty invalid" error when closing because of decimal mismatches
+        filled_amount = result.get('qty', amount) 
+        
+        new_position = Position(entry_price, filled_amount, direction == 'LONG')
         new_position.symbol = self.symbol 
         new_position.id, new_position.entry_time, new_position.entry_regime = result['trade_id'], self.clock.time(), self.trend_regime 
+        
+        # Store entry commission if the connector provided it (for accurate PnL)
+        if 'commission' in result:
+            new_position.entry_commission = result['commission']
+
         stop_distance = atr * self.config.ATR_INITIAL_STOP_MULTIPLIER if (atr > 0 and pd.notna(atr)) else entry_price * 0.01 
         new_position.kelly_risk_usd, new_position.atr_risk_usd = entry_price * new_position.amount, stop_distance * new_position.amount
         self.open_positions.append(new_position)
@@ -266,33 +237,24 @@ class MomentumAnchorBotBase(ABC):
                             f"    - Volume ({confirmation_details['volume_val']:,.2f} > {confirmation_details['volume_req']:,.2f}) -> [{'✅' if confirmation_details['volume_ok'] else '❌'}]")
         return True
 
-    
     def update_risk_parameters(self, log_status: bool = False):
-        """
-        Calculates and applies a dynamic sizing multiplier based on the
-        current drawdown, with configurable aggression and recovery.
-        """
-        
-        # --- 1. Get Capital State ---
         bot_realized_capital = getattr(self, 'notional_capital', self.capital)
         bot_unrealized_pnl = getattr(self, 'notional_unrealized_pnl', self.unrealized_pnl)
         bot_peak_equity = getattr(self, 'notional_peak_equity', self.peak_capital)
         current_equity = bot_realized_capital + bot_unrealized_pnl
         current_peak = bot_peak_equity
         
-        # --- 2. Get Config Controls ---
         drawdown_trigger_pct = getattr(self.config, 'MAX_DRAWDOWN_PERCENT', 10.0) / 100.0
         aggression = getattr(self.config, 'DE_RISK_AGGRESSION', 1.0)
         max_cut_pct = getattr(self.config, 'DE_RISK_MAX_CUT', 0.8)
         lower_bound_mult = getattr(self.config, 'DE_RISK_LOWER_BOUND', 0.1)
         re_risk_aggression = getattr(self.config, 'RE_RISK_AGGRESSION', 0.25)
 
-        # --- 3. Calculate Drawdown & Target Sizing Multiplier ---
         current_drawdown_pct = 0.0
         if current_peak > 0 and current_equity < current_peak:
             current_drawdown_pct = (current_peak - current_equity) / current_peak
         
-        target_multiplier = 1.0 # Default to 100% sizing
+        target_multiplier = 1.0 
 
         if current_drawdown_pct > 0 and drawdown_trigger_pct > 0:
             drawdown_progress = current_drawdown_pct / drawdown_trigger_pct
@@ -302,12 +264,9 @@ class MomentumAnchorBotBase(ABC):
             
         target_multiplier = max(lower_bound_mult, target_multiplier)
 
-        # --- 4. Apply Asymmetric Logic (Fast Down, Proportional Up) ---
-        
         current_multiplier = self.sizing_multiplier 
         
         if target_multiplier < current_multiplier:
-            # --- DE-RISK LOGIC ---
             self.sizing_multiplier = target_multiplier
             if log_status and not self.silent:
                 self.logger.warning(
@@ -315,9 +274,7 @@ class MomentumAnchorBotBase(ABC):
                     f"Drawdown {current_drawdown_pct:.2%} hit. "
                     f"Sizing multiplier SNAPPED DOWN from {current_multiplier:.2%} to {self.sizing_multiplier:.2%}"
                 )
-        
         elif target_multiplier > current_multiplier:
-            # --- RE-RISK LOGIC (Proportional Snap) ---
             gap_to_recover = target_multiplier - current_multiplier
             increase_amount = gap_to_recover * re_risk_aggression
             new_multiplier = current_multiplier + increase_amount
@@ -329,7 +286,6 @@ class MomentumAnchorBotBase(ABC):
                     f"Drawdown healing. Sizing SNAPPED UP from {current_multiplier:.2%} to {self.sizing_multiplier:.2%} "
                     f"(Target: {target_multiplier:.2%}, Aggression: {re_risk_aggression:.0%})"
                 )
-        
         else:
             if log_status and not self.silent:
                 self.logger.info(
@@ -338,13 +294,10 @@ class MomentumAnchorBotBase(ABC):
                     f"Sizing multiplier remains {self.sizing_multiplier:.2%}"
                 )
 
-        # --- 5. Apply the Final Multiplier to Bot Parameters ---
         self.max_position_size = self.config.MAX_POSITION_SIZE_PERCENT * self.sizing_multiplier
         self.kelly_fraction = self.config.KELLY_FRACTION * self.sizing_multiplier
 
-
     def update_kelly_fraction(self):
-        """Updates the Kelly fraction based on recent trade history."""
         if len(self.trade_history) < self.config.KELLY_LOOKBACK: return
         recent_pnls = [t.pnl_percent / 100 for t in self.trade_history[-self.config.KELLY_LOOKBACK:]]
         wins = [p for p in recent_pnls if p > 0]
@@ -356,18 +309,12 @@ class MomentumAnchorBotBase(ABC):
         avg_loss = abs(np.mean(losses)) if losses else 0.00001 
 
         win_loss_ratio = avg_win / avg_loss if avg_loss > 0 else avg_win / 0.00001 
-
         kelly_raw = win_rate - (1 - win_rate) / win_loss_ratio if win_loss_ratio > 0 else 0.0
         
-        # Set the base kelly fraction
-        self.config.KELLY_FRACTION = max(self.config.KELLY_MIN_FRACTION, min(kelly_raw, 1.0)) # Use 1.0 as max
-        
-        # Re-apply the sizing multiplier to the (potentially) new base kelly
+        self.config.KELLY_FRACTION = max(self.config.KELLY_MIN_FRACTION, min(kelly_raw, 1.0)) 
         self.kelly_fraction = self.config.KELLY_FRACTION * self.sizing_multiplier
 
-
     def update_strategy_on_30m(self, data_row: dict):
-        """Updates the strategy logic on a 30-minute candle close."""
         old_trend_regime = self.trend_regime
         self.trend_regime = self._get_trend_regime(data_row)
         rebuild_reason = None
@@ -386,15 +333,10 @@ class MomentumAnchorBotBase(ABC):
                 self.logger.info(f"🧠 [STRATEGY_UPDATE] | Regime stable ({self.trend_regime}). No anchor reset needed.")
             
         self.update_kelly_fraction()
-        
-        # Pass log_status=True to enable logging of risk changes
         self.update_risk_parameters(log_status=True)
 
-
     def log_performance(self, print_log: bool = False, logger=None) -> dict:
-        """Generates a dictionary and a string summarizing bot performance."""
         if logger is None: logger = self.logger
-        
         is_backtest = self.connector.__class__.__name__ == 'DummyConnector'
         is_model_c_run = is_backtest and (self.capital_allocation != 1.0)
 
@@ -466,7 +408,6 @@ class MomentumAnchorBotBase(ABC):
                 regime_wins = sum(1 for t in trades if t.pnl_cash > 0)
                 regime_gross_profit = sum(t.pnl_cash for t in trades if t.pnl_cash > 0)
                 regime_gross_loss = abs(sum(t.pnl_cash for t in trades if t.pnl_cash < 0))
-                
                 if regime_gross_loss < 0.01:
                     regime_profit_factor_str = f"{regime_gross_profit / 1.0:.2f}" if regime_gross_profit > 0 else "0.00"
                 else:
@@ -484,7 +425,6 @@ class MomentumAnchorBotBase(ABC):
         return metrics
 
     def _get_performance_log_str(self, metrics: dict) -> str:
-        """Helper to format the final performance log string."""
         winning_trades, losing_trades = [t.pnl_cash for t in self.trade_history if t.pnl_cash > 0], [t.pnl_cash for t in self.trade_history if t.pnl_cash < 0]
         wins, losses = len(winning_trades), len(losing_trades)
         avg_winner_usd, avg_loser_usd = np.mean(winning_trades) if wins > 0 else 0, np.mean(losing_trades) if losses > 0 else 0
@@ -492,7 +432,6 @@ class MomentumAnchorBotBase(ABC):
         open_longs, open_shorts = sum(1 for p in self.open_positions if p.is_long), sum(1 for p in self.open_positions if not p.is_long)
 
         is_backtest = self.connector.__class__.__name__ == 'DummyConnector'
-        
         capital_source = "(Backtest Model A)"
         if not is_backtest:
             capital_source = "(Synced from exchange)"
