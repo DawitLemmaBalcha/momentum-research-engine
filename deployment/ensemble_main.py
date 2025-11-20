@@ -25,6 +25,7 @@ from deployment.ensemble_config import VENUES
 from core.trading_bot_shared import MomentumAnchorBotShared
 from core.core_types import SimulationClock, Tick, Position
 
+logging.Formatter.converter = time.gmtime
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
 log_timestamp = time.strftime("%Y-%m-%d_%H-%M-%S", time.gmtime())
@@ -45,7 +46,7 @@ logger = logging.getLogger(__name__)
 PORTFOLIO_SYNC_INTERVAL_SECONDS = 10  
 INDICATOR_PRIMING_CANDLES = 1000 
 MAX_DATAFRAME_LENGTH = 1500      
-WATCHDOG_TIMEOUT_SECONDS = 60 # <-- NEW: Reconnect if no data for 60s
+WATCHDOG_TIMEOUT_SECONDS = 60 
 
 class LiveDataManager:
     """
@@ -58,12 +59,13 @@ class LiveDataManager:
         self.bots_by_symbol: Dict[str, List[MomentumAnchorBotShared]] = {}
         
         self.indicator_state_by_symbol: Dict[str, Dict] = {}
-        
         self.dataframes: Dict[str, pd.DataFrame] = {}
         
-        # --- NEW: Watchdog Timer ---
-        self.last_data_time = time.time()
-        # ---------------------------
+        # --- NEW: Multi-Channel Liveness Tracker ---
+        # Keys: "{symbol}_{stream_type}" (e.g., "BTC/USDT_1m")
+        # Values: timestamp of last update
+        self.liveness_tracker: Dict[str, float] = {} 
+        # -------------------------------------------
 
         self.unique_1m_rsi_periods_by_symbol = defaultdict(set)
         self.unique_1m_vol_ma_periods_by_symbol = defaultdict(set)
@@ -76,6 +78,11 @@ class LiveDataManager:
             
             self.unique_1m_rsi_periods_by_symbol[bot.symbol].add(bot.config.CONFIRMATION_RSI_PERIOD)
             self.unique_1m_vol_ma_periods_by_symbol[bot.symbol].add(bot.config.CONFIRMATION_VOLUME_MA_PERIOD)
+
+            # Initialize liveness keys for this symbol
+            self.liveness_tracker[f"{bot.symbol}_1m"] = time.time()
+            self.liveness_tracker[f"{bot.symbol}_30m"] = time.time()
+            self.liveness_tracker[f"{bot.symbol}_tick"] = time.time()
 
     def _parse_candle(self, candle_data) -> dict:
         if isinstance(candle_data, dict):
@@ -133,8 +140,11 @@ class LiveDataManager:
                 else:
                     logger.error(f"Failed to get initial 30m data for {symbol}, bots will not start with active anchors.")
                 
-                # Initialize watchdog on success
-                self.last_data_time = time.time()
+                # Initialize watchdog timestamps on success
+                now = time.time()
+                self.liveness_tracker[f"{symbol}_1m"] = now
+                self.liveness_tracker[f"{symbol}_30m"] = now
+                self.liveness_tracker[f"{symbol}_tick"] = now
 
             except Exception as e:
                 logger.error(f"Failed to prime data for {symbol}: {e}. This symbol will not trade.")
@@ -251,13 +261,15 @@ class LiveDataManager:
 
 
     def _on_private_message(self, message: dict):
-        # Private messages (order updates) also count as "liveness"
-        self.last_data_time = time.time()
+        # Private messages don't block a specific symbol's liveness, 
+        # but we can track them if needed. For now, just log.
         logger.info(f"Received Private WebSocket Data: {message}")
 
 
     def _on_1m_candle(self, candle_data, symbol: str):
-        self.last_data_time = time.time()
+        # Update liveness tracker REGARDLESS of confirmation
+        # This proves the socket is alive and sending data
+        self.liveness_tracker[f"{symbol}_1m"] = time.time()
         
         if not candle_data.get('confirm', False):
             return
@@ -285,7 +297,8 @@ class LiveDataManager:
             logger.error(f"Error processing 1m candle for {symbol}: {e}")
 
     def _on_30m_candle(self, candle_data, symbol: str):
-        self.last_data_time = time.time()
+        # Update liveness tracker REGARDLESS of confirmation
+        self.liveness_tracker[f"{symbol}_30m"] = time.time()
         
         if not candle_data.get('confirm', False):
             return
@@ -315,7 +328,8 @@ class LiveDataManager:
             logger.error(f"Error processing 30m candle for {symbol}: {e}")
 
     def _on_tick(self, tick: Tick, symbol: str):
-        self.last_data_time = time.time()
+        # Update liveness for ticks
+        self.liveness_tracker[f"{symbol}_tick"] = time.time()
         
         try:
             state = self.indicator_state_by_symbol.get(symbol, {})
@@ -327,21 +341,15 @@ class LiveDataManager:
                 return 
 
             # --- FIX: Data Stitch Validator (Staleness Check) ---
-            # Ensure 30m data is not stale relative to 1m data.
-            # The 30m row is the PREVIOUS closed 30m candle (Anchor).
-            # The 1m row is the PREVIOUS closed 1m candle.
-            # If the 1m row timestamp is more than 62 minutes ahead of the 30m row timestamp,
-            # it means we have missed at least one full 30m candle close.
-            
             ts_30m = current_30m_row.get('timestamp')
             ts_1m = current_1m_row.get('timestamp')
             
             if ts_30m and ts_1m:
                 time_diff_seconds = (ts_1m - ts_30m).total_seconds()
-                # 30m (candle) + 30m (next candle) + 2m (buffer) = 62 mins = 3720s
-                if time_diff_seconds > 3720:
-                    logger.warning(f"⚠️ [STALENESS] 30m data (TS: {ts_30m}) is stale relative to 1m data (TS: {ts_1m}). Skipping tick.")
-                    return
+                if time_diff_seconds > 3720: # 62 mins
+                    # Rate limit logging for this warning
+                    # (Optimization: Could add a timer here to avoid flooding logs)
+                    return 
             # ----------------------------------------------------
 
             merged_current_row = pd.concat([pd.Series(current_30m_row), current_1m_row])
@@ -473,7 +481,6 @@ class Venue:
                         new_pos.symbol = bot.symbol
                         
                         # --- FIX: Robust Orphan Adoption ---
-                        # Set a valid entry regime so closing logic doesn't crash
                         new_pos.entry_regime = "adopted_orphan" 
                         # -----------------------------------
                         
@@ -602,28 +609,36 @@ class EnsembleTrader:
 
             logger.info("All venues running. Waiting for exit signal (Ctrl+C).")
             
-            # --- FIX: Watchdog Main Loop ---
+            # --- FIX: Multi-Channel Watchdog Main Loop ---
             while True:
-                time.sleep(1) # Tighter loop for watchdog checks
+                time.sleep(1) 
                 
                 current_time = time.time()
                 for venue in self.venues:
                     if not venue.data_manager: continue
                     
-                    last_data = venue.data_manager.last_data_time
-                    if current_time - last_data > WATCHDOG_TIMEOUT_SECONDS:
-                        logger.error(f"🚨 [WATCHDOG] Venue '{venue.name}' timed out! No data for {int(current_time - last_data)}s. Reconnecting...")
-                        
-                        # Attempt reconnect
-                        try:
-                            venue.connector.disconnect()
-                            time.sleep(2)
-                            venue.connector.connect()
-                            venue.data_manager.start_all_streams() # Resubscribe
-                            venue.data_manager.last_data_time = time.time() # Reset timer
-                            logger.info(f"✅ [WATCHDOG] Venue '{venue.name}' reconnected.")
-                        except Exception as e:
-                             logger.error(f"❌ [WATCHDOG] Reconnect failed: {e}")
+                    # Iterate over all tracked streams (e.g., BTC/USDT_1m, BTC/USDT_30m)
+                    for stream_key, last_ts in list(venue.data_manager.liveness_tracker.items()):
+                        if current_time - last_ts > WATCHDOG_TIMEOUT_SECONDS:
+                            logger.error(f"🚨 [WATCHDOG] Stream '{stream_key}' died! Last update: {int(current_time - last_ts)}s ago. Triggering Venue Reconnect...")
+                            
+                            try:
+                                venue.connector.disconnect()
+                                time.sleep(2)
+                                venue.connector.connect()
+                                venue.data_manager.start_all_streams() 
+                                
+                                # Reset all keys to now to prevent infinite loops
+                                now = time.time()
+                                for k in venue.data_manager.liveness_tracker.keys():
+                                    venue.data_manager.liveness_tracker[k] = now
+                                    
+                                logger.info(f"✅ [WATCHDOG] Venue '{venue.name}' reconnected successfully.")
+                                break # Break inner loop to restart venue monitoring
+                            except Exception as e:
+                                 logger.error(f"❌ [WATCHDOG] Reconnect failed: {e}")
+                                 # Update timestamp to prevent log flooding, hope next cycle fixes it
+                                 venue.data_manager.liveness_tracker[stream_key] = time.time() 
                 # -------------------------------
 
         except KeyboardInterrupt:
@@ -640,14 +655,11 @@ class EnsembleTrader:
                 for bot in venue.bots:
                     if bot.open_positions:
                         logger.warning(f"⚠️  Closing {len(bot.open_positions)} open positions for bot {bot.bot_id}...")
-                        # Create a copy of the list because close_position modifies it
                         for pos in list(bot.open_positions):
                             try:
-                                # Note: current_price might be stale if socket died, 
-                                # but connector will likely market close anyway.
                                 close_price = bot.clock.current_price if bot.clock.current_price > 0 else pos.entry_price
                                 bot.close_position(pos, close_price, "Emergency Shutdown")
-                                time.sleep(0.2) # Avoid rate limits during panic close
+                                time.sleep(0.2) 
                             except Exception as e:
                                 logger.error(f"Failed to panic close position {pos.id}: {e}")
             # --------------------------------------------

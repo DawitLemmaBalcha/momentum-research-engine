@@ -1,4 +1,4 @@
-# core_types.py
+# core/core_types.py
 
 import time
 from typing import List
@@ -25,10 +25,9 @@ class TradeLog:
     size: float
     kelly_risk_usd: float
     atr_risk_usd: float
-    entry_regime: str # <<< ADD THIS LINE to store the regime at the time of entry
+    entry_regime: str 
 
 class Position:
-    # ... (No changes to this class) ...
     def __init__(self, entry_price: float, amount: float, is_long: bool):
         self.id: str = "" # To be filled by the exchange trade ID
         self.entry_price = entry_price
@@ -40,7 +39,12 @@ class Position:
         self.kelly_risk_usd: float = 0.0
         self.atr_risk_usd: float = 0.0
         self.is_trailing_active: bool = False
-        self.entry_regime: str = "" # <<< ADD THIS LINE to store the regime on the position object
+        self.entry_regime: str = ""
+        
+        # --- ADDED FIELDS ---
+        self.entry_commission: float = 0.0   # Tracks entry fees for true Net PnL
+        self.last_logged_stop_loss: float = 0.0 # Prevents log spam for trailing stops
+        # --------------------
 
     def calculate_profit(self, current_price: float) -> float:
         return (current_price - self.entry_price) * self.amount if self.is_long else (self.entry_price - current_price) * self.amount
@@ -52,13 +56,10 @@ class Order:
         self.order_type = order_type
         self.last_rejection_reason = ""
 
-# ... (keep the SimulationClock class the same)
-
 class SimulationClock:
-    # ... (No changes to this class) ...
     def __init__(self, start_time):
         self.current_time = start_time
-        self.current_price = 0.0 # Will be updated with each tick
+        self.current_price = 0.0 
 
     def advance(self, seconds):
         self.current_time += seconds

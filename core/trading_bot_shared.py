@@ -90,7 +90,7 @@ class MomentumAnchorBotShared(MomentumAnchorBotBase):
                     if not macd_ok: reasons.append(f"MACD FAILED ({macd_1m:.2f})")
 
                     vol_confirm_factor = getattr(self.config, 'VOLUME_CONFIRMATION_FACTOR', 1.0)
-                    if not volume_ok: reasons.append(f"VOLUME FAILED ({volume_1m:,.0f} < {volume_ma_1m * vol_confirm_factor:,.0f})")
+                    if not volume_ok: reasons.append(f"VOLUME FAILED ({int(volume_1m)} < {int(volume_ma_1m * vol_confirm_factor)})")
 
                     rejection_string = ", ".join(reasons)
 

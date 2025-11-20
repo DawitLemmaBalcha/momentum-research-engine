@@ -84,6 +84,11 @@ class BybitDemoConnector(BaseConnector):
                     entry_price = float(trade.get('avgPrice', 0.0))
                     commission = float(trade.get('execFee', 0.0))
                 
+                if commission == 0.0 and entry_price > 0:
+                    # Standard Taker Fee is 0.055% (0.00055)
+                    commission = (entry_price * float(qty_str)) * 0.00055
+                    self.logger.warning(f"API returned 0 commission. Using fallback calculation: ${commission:.4f}")
+
                 # Fallback if avgPrice is not yet available (unlikely for market order but possible)
                 if entry_price == 0.0:
                     entry_price = price if price else 0.0 
@@ -145,6 +150,10 @@ class BybitDemoConnector(BaseConnector):
                 if close_price == 0.0:
                     self.logger.warning("Close order placed but avgPrice unavailable. PnL calc may be inaccurate.")
                     close_price = position.entry_price # Prevent crash
+
+                if exit_commission == 0.0 and close_price > 0:
+                    exit_commission = (close_price * position.amount) * 0.00055
+                    self.logger.warning(f"API returned 0 exit fee. Using fallback calculation: ${exit_commission:.4f}")
 
                 entry_commission = getattr(position, 'entry_commission', 0.0)
                 total_commission = entry_commission + exit_commission

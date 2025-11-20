@@ -173,8 +173,20 @@ class MomentumAnchorBotBase(ABC):
                     position.peak_price = min(position.peak_price, current_price)
                     new_stop = min(position.stop_loss, position.peak_price + trailing_distance)
                 
-                if new_stop != position.stop_loss:
-                    if not self.silent: self.logger.info(f"{current_time_str} - 🔒 Trailing SL moved to {new_stop:,.2f} for position {position.id}")
+                if position.last_logged_stop_loss == 0.0:
+                    position.last_logged_stop_loss = position.stop_loss if position.stop_loss else new_stop
+
+                if position.last_logged_stop_loss > 0:
+                    change_pct = abs(new_stop - position.last_logged_stop_loss) / position.last_logged_stop_loss
+                else:
+                    change_pct = 1.0 # Force log if invalid
+
+                # Only log if moved > 0.05% (0.0005)
+                if change_pct > 0.0005:
+                    if not self.silent: 
+                        self.logger.info(f"{current_time_str} - 🔒 Trailing SL moved to {new_stop:,.2f} for position {position.id}")
+                    position.last_logged_stop_loss = new_stop
+                
                 position.stop_loss = new_stop
 
 
