@@ -489,7 +489,7 @@ if __name__ == "__main__":
         #{'is_start': '2025-05-01 00:00:00', 'is_end': '2025-08-01 00:00:00', 'oos_end': '2025-09-01 00:00:00'},
     ]
     
-    trials_per_optimization_walk = 500 
+    trials_per_optimization_walk = 50 
     number_of_clusters = 3           
     top_n_per_cluster = 3              
 

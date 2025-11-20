@@ -14,7 +14,7 @@ import pandas as pd
 import pandas_ta as ta
 from collections import deque, defaultdict
 from dotenv import load_dotenv
-from datetime import datetime # <-- Added
+from datetime import datetime, timedelta
 
 dotenv_path = os.path.join(project_root, 'api.env')
 load_dotenv(dotenv_path=dotenv_path)
@@ -43,8 +43,9 @@ logger = logging.getLogger(__name__)
 
 # --- CONFIGURABLE CONSTANTS ---
 PORTFOLIO_SYNC_INTERVAL_SECONDS = 10  
-INDICATOR_PRIMING_CANDLES = 1000 # <-- INCREASED: Maximize history to prevent indicator drift
-MAX_DATAFRAME_LENGTH = 1500      # <-- INCREASED: Keep enough history for 1000 + buffer
+INDICATOR_PRIMING_CANDLES = 1000 
+MAX_DATAFRAME_LENGTH = 1500      
+WATCHDOG_TIMEOUT_SECONDS = 60 # <-- NEW: Reconnect if no data for 60s
 
 class LiveDataManager:
     """
@@ -59,6 +60,10 @@ class LiveDataManager:
         self.indicator_state_by_symbol: Dict[str, Dict] = {}
         
         self.dataframes: Dict[str, pd.DataFrame] = {}
+        
+        # --- NEW: Watchdog Timer ---
+        self.last_data_time = time.time()
+        # ---------------------------
 
         self.unique_1m_rsi_periods_by_symbol = defaultdict(set)
         self.unique_1m_vol_ma_periods_by_symbol = defaultdict(set)
@@ -127,6 +132,9 @@ class LiveDataManager:
                         bot.initialize_state(initial_30m_anchor_data)
                 else:
                     logger.error(f"Failed to get initial 30m data for {symbol}, bots will not start with active anchors.")
+                
+                # Initialize watchdog on success
+                self.last_data_time = time.time()
 
             except Exception as e:
                 logger.error(f"Failed to prime data for {symbol}: {e}. This symbol will not trade.")
@@ -181,11 +189,9 @@ class LiveDataManager:
         try:
             config = self.bots_by_symbol[symbol][0].config
         except (KeyError, IndexError):
-            logger.warning(f"[_get_trend_regime] Could not find config for symbol {symbol}")
             return "neutral"
         
         c = config
-        
         try:
             short_ma = data_row.get('short_ema')
             long_ma = data_row.get('long_ema')
@@ -196,10 +202,8 @@ class LiveDataManager:
             current_price = data_row.get('close')
             
             if any(v is None for v in [short_ma, long_ma, rsi, macd, bb_upper, bb_lower, current_price]):
-                logger.warning(f"[_get_trend_regime] Missing key indicator data in row.")
                 return "neutral"
-        except KeyError as e:
-            logger.error(f"[_get_trend_regime] KeyError: {e}")
+        except KeyError:
             return "neutral"
 
         trend = "neutral"
@@ -218,20 +222,17 @@ class LiveDataManager:
 
     def start_all_streams(self):
         logger.info(f"Starting data streams for all symbols...")
-        
         for symbol in self.bots_by_symbol.keys():
             try:
                 self.connector.start_public_stream(
                     symbol=symbol,
                     on_tick_callback=self._on_tick
                 )
-                
                 self.connector.start_kline_stream(
                     symbol=symbol,
                     interval="1",
                     on_kline_callback=self._on_1m_candle
                 )
-                
                 self.connector.start_kline_stream(
                     symbol=symbol,
                     interval="30",
@@ -250,15 +251,16 @@ class LiveDataManager:
 
 
     def _on_private_message(self, message: dict):
+        # Private messages (order updates) also count as "liveness"
+        self.last_data_time = time.time()
         logger.info(f"Received Private WebSocket Data: {message}")
 
 
     def _on_1m_candle(self, candle_data, symbol: str):
-        # --- FIX: Infinite Candle Bug ---
-        # Ignore the update if the candle is not yet confirmed (closed)
+        self.last_data_time = time.time()
+        
         if not candle_data.get('confirm', False):
             return
-        # --------------------------------
 
         try:
             candle_dict = self._parse_candle(candle_data)
@@ -283,6 +285,8 @@ class LiveDataManager:
             logger.error(f"Error processing 1m candle for {symbol}: {e}")
 
     def _on_30m_candle(self, candle_data, symbol: str):
+        self.last_data_time = time.time()
+        
         if not candle_data.get('confirm', False):
             return
 
@@ -311,6 +315,8 @@ class LiveDataManager:
             logger.error(f"Error processing 30m candle for {symbol}: {e}")
 
     def _on_tick(self, tick: Tick, symbol: str):
+        self.last_data_time = time.time()
+        
         try:
             state = self.indicator_state_by_symbol.get(symbol, {})
             current_1m_row = state.get('1m_row')   
@@ -320,8 +326,25 @@ class LiveDataManager:
             if not isinstance(current_1m_row, pd.Series) or not current_30m_row:
                 return 
 
-            merged_current_row = pd.concat([pd.Series(current_30m_row), current_1m_row])
+            # --- FIX: Data Stitch Validator (Staleness Check) ---
+            # Ensure 30m data is not stale relative to 1m data.
+            # The 30m row is the PREVIOUS closed 30m candle (Anchor).
+            # The 1m row is the PREVIOUS closed 1m candle.
+            # If the 1m row timestamp is more than 62 minutes ahead of the 30m row timestamp,
+            # it means we have missed at least one full 30m candle close.
             
+            ts_30m = current_30m_row.get('timestamp')
+            ts_1m = current_1m_row.get('timestamp')
+            
+            if ts_30m and ts_1m:
+                time_diff_seconds = (ts_1m - ts_30m).total_seconds()
+                # 30m (candle) + 30m (next candle) + 2m (buffer) = 62 mins = 3720s
+                if time_diff_seconds > 3720:
+                    logger.warning(f"⚠️ [STALENESS] 30m data (TS: {ts_30m}) is stale relative to 1m data (TS: {ts_1m}). Skipping tick.")
+                    return
+            # ----------------------------------------------------
+
+            merged_current_row = pd.concat([pd.Series(current_30m_row), current_1m_row])
             atr_30m = current_30m_row.get('atr', 0.0)
 
             for bot in self.bots_by_symbol[symbol]:
@@ -341,9 +364,6 @@ class LiveDataManager:
 
 
 class Venue:
-    """
-    Manages a single trading venue (e.g., one exchange account).
-    """
     def __init__(self, name, config):
         self.name = name
         self.config = config
@@ -364,17 +384,15 @@ class Venue:
             return False
 
         connection_params = self.config["connection_params"]
-        
         if 'api_key' in connection_params and not connection_params['api_key']:
-             logger.error(f"API key for venue '{self.name}' is missing or was not loaded correctly. Check your .env file and ensemble_config.py.")
+             logger.error(f"API key for venue '{self.name}' is missing. Check .env.")
              return False
 
         self.connector = connector_class(**connection_params)
 
         live_balance = self.connector.get_wallet_balance(coin="USDT")
-        
         if live_balance <= 0:
-            logger.error(f"Venue '{self.name}' has zero or invalid balance ({live_balance}). Cannot start bots.")
+            logger.error(f"Venue '{self.name}' has zero/invalid balance ({live_balance}). Cannot start bots.")
             return False
         
         self.master_peak_capital = live_balance 
@@ -394,11 +412,10 @@ class Venue:
             strategy_configs.append(strategy_module)
             total_requested_capital += strategy_module.INITIAL_CAPITAL
 
-        logger.info(f"Venue '{self.name}' live balance is {live_balance:,.2f} USDT. Sizing allocation will be based on strategy weights (total requested: ${total_requested_capital:,.2f}).")
+        logger.info(f"Venue '{self.name}' live balance is {live_balance:,.2f} USDT. Sizing allocation based on strategy weights.")
 
         for strategy_module in strategy_configs:
             clock = SimulationClock(start_time=time.time())
-            
             bot_allocation = strategy_module.INITIAL_CAPITAL / total_requested_capital if total_requested_capital > 0 else 1.0 / num_bots_in_venue
 
             bot = MomentumAnchorBotShared(
@@ -421,18 +438,12 @@ class Venue:
 
             log_directory = os.path.join(project_root, 'logs', self.name)
             os.makedirs(log_directory, exist_ok=True)
-            
             log_file_path = os.path.join(log_directory, f"{strategy_name}.log")
             bot_file_handler = logging.FileHandler(log_file_path)
-            bot_file_handler.setFormatter(
-                logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-            )
-            
+            bot_file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
             if not bot_logger.hasHandlers():
                 bot_logger.addHandler(bot_file_handler)
-
             bot.logger = bot_logger
-
 
             self.bots.append(bot)
             logger.info(f"Initialized bot: {bot.bot_id} on Venue: {self.name} for symbol {bot.symbol} with {bot.capital_allocation:.2%} allocation.")
@@ -450,7 +461,7 @@ class Venue:
                 found_bot = False
                 for bot in self.bots:
                     if bot.symbol.replace('/', '') == symbol:
-                        logger.warning(f"Found orphaned position for {symbol}: {side} {qty} @ {entry_price}")
+                        logger.warning(f"Found orphaned position for {symbol}: {side} {qty} @ {entry_price}. Adopting.")
                         
                         new_pos = Position(
                             entry_price=entry_price,
@@ -460,6 +471,11 @@ class Venue:
                         new_pos.id = "orphaned_" + str(int(time.time()))
                         new_pos.entry_time = time.time()
                         new_pos.symbol = bot.symbol
+                        
+                        # --- FIX: Robust Orphan Adoption ---
+                        # Set a valid entry regime so closing logic doesn't crash
+                        new_pos.entry_regime = "adopted_orphan" 
+                        # -----------------------------------
                         
                         bot.open_positions.append(new_pos)
                         found_bot = True
@@ -473,14 +489,12 @@ class Venue:
             logger.error(f"CRITICAL: Failed to hydrate bot state: {e}. Positions may be orphaned.", exc_info=True)
         
         self.data_manager = LiveDataManager(self.bots, self.connector)
-        
         return True
 
     def connect_and_run_streams(self):
         if self.connector:
             logger.info(f"Connecting Venue: {self.name}...")
             self.connector.connect()
-            
             self.data_manager.prime_all_data()
             self.data_manager.start_all_streams()
 
@@ -490,10 +504,8 @@ class Venue:
         self.portfolio_sync_thread.start()
         
     def _update_dynamic_allocations(self):
-        
         weights = [bot.sizing_multiplier for bot in self.bots]
         total_weight = sum(weights)
-        
         if total_weight <= 0:
             num_bots = len(self.bots)
             if num_bots > 0:
@@ -507,18 +519,10 @@ class Venue:
             bot.capital_allocation = new_allocation
 
     def _portfolio_sync_loop(self):
-        """
-        [THREADED] This loop runs continuously to sync the true portfolio
-        state with all bot instances.
-        """
         last_risk_update_minute = -1
-
         while True:
             try:
-                # 1. Get Realized Capital
                 realized_capital = self.connector.get_wallet_balance("USDT")
-                
-                # 2. Calculate Unrealized PnL
                 unrealized_pnl = 0.0
                 try:
                     open_positions = self.connector.get_open_positions()
@@ -527,30 +531,22 @@ class Venue:
                         entry_price = float(pos['entry_price'])
                         qty = float(pos['qty'])
                         side = pos['side']
-                        
                         mark_price = self.connector.get_mark_price(symbol)
-
                         if mark_price > 0:
-                            if side == 'Buy':
-                                unrealized_pnl += (mark_price - entry_price) * qty
-                            else:
-                                unrealized_pnl += (entry_price - mark_price) * qty
-                
+                            if side == 'Buy': unrealized_pnl += (mark_price - entry_price) * qty
+                            else: unrealized_pnl += (entry_price - mark_price) * qty
                 except Exception as e:
                     logger.warning(f"Could not calculate UPL on this cycle: {e}. UPL will be 0.")
                     unrealized_pnl = 0.0
 
-                # 3. Update Master Capital States
                 current_total_equity = realized_capital + unrealized_pnl
                 self.master_peak_capital = max(self.master_peak_capital, current_total_equity)
 
-                # 4. Inject State into ALL Bots
                 for bot in self.bots:
                     bot.capital = realized_capital
                     bot.unrealized_pnl = unrealized_pnl
                     bot.peak_capital = self.master_peak_capital
                 
-                # --- FIX: 5-MINUTE RISK HEARTBEAT ---
                 current_dt = datetime.now()
                 if current_dt.minute % 5 == 0 and current_dt.minute != last_risk_update_minute:
                     logger.info("❤️ [HEARTBEAT] Updating Risk Parameters & Allocations...")
@@ -558,14 +554,11 @@ class Venue:
                         bot.update_risk_parameters()
                     self._update_dynamic_allocations()
                     last_risk_update_minute = current_dt.minute
-                # ------------------------------------
                 
                 alloc_strs = []
                 for bot in self.bots:
-                    try:
-                        bot_name = bot.bot_id.split(f"{self.name}_")[-1]
-                    except Exception:
-                        bot_name = bot.bot_id
+                    try: bot_name = bot.bot_id.split(f"{self.name}_")[-1]
+                    except Exception: bot_name = bot.bot_id
                     alloc_strs.append(f"{bot_name}: {bot.capital_allocation:.1%}")
                 alloc_summary = ", ".join(alloc_strs)
 
@@ -582,12 +575,10 @@ class Venue:
             
             time.sleep(PORTFOLIO_SYNC_INTERVAL_SECONDS)
 
-
     def disconnect(self):
         if self.connector:
             logger.info(f"Disconnecting Venue: {self.name}...")
             self.connector.disconnect()
-
 
 class EnsembleTrader:
     def __init__(self, venues_config: Dict):
@@ -603,24 +594,68 @@ class EnsembleTrader:
             logger.error("No valid venues configured or ready to run.")
             return
 
-        threads = []
         try:
             for venue in self.venues:
                 logger.info(f"--- Starting Venue: {venue.name} ---")
-                
                 venue.connect_and_run_streams()
                 venue.start_portfolio_sync()
 
             logger.info("All venues running. Waiting for exit signal (Ctrl+C).")
+            
+            # --- FIX: Watchdog Main Loop ---
             while True:
-                time.sleep(60)
+                time.sleep(1) # Tighter loop for watchdog checks
                 
+                current_time = time.time()
+                for venue in self.venues:
+                    if not venue.data_manager: continue
+                    
+                    last_data = venue.data_manager.last_data_time
+                    if current_time - last_data > WATCHDOG_TIMEOUT_SECONDS:
+                        logger.error(f"🚨 [WATCHDOG] Venue '{venue.name}' timed out! No data for {int(current_time - last_data)}s. Reconnecting...")
+                        
+                        # Attempt reconnect
+                        try:
+                            venue.connector.disconnect()
+                            time.sleep(2)
+                            venue.connector.connect()
+                            venue.data_manager.start_all_streams() # Resubscribe
+                            venue.data_manager.last_data_time = time.time() # Reset timer
+                            logger.info(f"✅ [WATCHDOG] Venue '{venue.name}' reconnected.")
+                        except Exception as e:
+                             logger.error(f"❌ [WATCHDOG] Reconnect failed: {e}")
+                # -------------------------------
+
         except KeyboardInterrupt:
-            logger.info("Shutdown signal received. Disconnecting all venues...")
+            logger.info("Shutdown signal received (Ctrl+C).")
+        except Exception as e:
+            logger.error(f"Fatal error in main loop: {e}", exc_info=True)
         finally:
+            # --- FIX: Shutdown Protocol (Panic Close) ---
+            logger.warning("🛑 [SHUTDOWN PROTOCOL] Initiating Emergency Shutdown...")
+            for venue in self.venues:
+                if not venue.bots: continue
+                
+                logger.warning(f"Checking open positions for venue {venue.name}...")
+                for bot in venue.bots:
+                    if bot.open_positions:
+                        logger.warning(f"⚠️  Closing {len(bot.open_positions)} open positions for bot {bot.bot_id}...")
+                        # Create a copy of the list because close_position modifies it
+                        for pos in list(bot.open_positions):
+                            try:
+                                # Note: current_price might be stale if socket died, 
+                                # but connector will likely market close anyway.
+                                close_price = bot.clock.current_price if bot.clock.current_price > 0 else pos.entry_price
+                                bot.close_position(pos, close_price, "Emergency Shutdown")
+                                time.sleep(0.2) # Avoid rate limits during panic close
+                            except Exception as e:
+                                logger.error(f"Failed to panic close position {pos.id}: {e}")
+            # --------------------------------------------
+            
+            logger.info("Disconnecting all venues...")
             for venue in self.venues:
                 venue.disconnect()
-            logger.info("Ensemble trader shut down.")
+            logger.info("Ensemble trader shut down cleanly.")
 
 
 if __name__ == "__main__":
@@ -637,7 +672,6 @@ if __name__ == "__main__":
         sys.exit(1)
 
     venue_to_run_name = sys.argv[1]
-    
     venues_to_run = {name: config for name, config in VENUES.items() if name == venue_to_run_name}
     
     if not venues_to_run:
