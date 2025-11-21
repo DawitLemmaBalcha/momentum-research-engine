@@ -61,12 +61,9 @@ class LiveDataManager:
         self.indicator_state_by_symbol: Dict[str, Dict] = {}
         self.dataframes: Dict[str, pd.DataFrame] = {}
         
-        # --- NEW: Multi-Channel Liveness Tracker ---
-        # Keys: "{symbol}_{stream_type}" (e.g., "BTC/USDT_1m")
-        # Values: timestamp of last update
+        # --- Multi-Channel Liveness Tracker ---
         self.liveness_tracker: Dict[str, float] = {} 
-        # -------------------------------------------
-
+        
         self.unique_1m_rsi_periods_by_symbol = defaultdict(set)
         self.unique_1m_vol_ma_periods_by_symbol = defaultdict(set)
         
@@ -159,15 +156,20 @@ class LiveDataManager:
 
         config = self.bots_by_symbol[symbol][0].config
 
+        # --- FIX 1: DOUBLE SHIFT BUG REMOVED ---
+        # The dataframe here ends with the confirmed candle (T-1). 
+        # We do NOT shift again, otherwise we would be reading T-2.
+        
         for p in rsi_periods:
-            df[f'rsi_1m_{p}'] = ta.rsi(df['close'], length=p).shift(1)
+            df[f'rsi_1m_{p}'] = ta.rsi(df['close'], length=p) # .shift(1) removed
 
         for p in vol_ma_periods:
-            df[f'volume_ma_1m_{p}'] = df['volume'].rolling(window=p).mean().shift(1)
+            df[f'volume_ma_1m_{p}'] = df['volume'].rolling(window=p).mean() # .shift(1) removed
 
         macd_1m = ta.macd(df['close'], fast=config.CONFIRMATION_MACD_FAST_PERIOD, slow=config.CONFIRMATION_MACD_SLOW_PERIOD, signal=config.CONFIRMATION_MACD_SIGNAL_PERIOD)
         
-        df[f'macd_1m_{config.CONFIRMATION_MACD_FAST_PERIOD}_{config.CONFIRMATION_MACD_SLOW_PERIOD}_{config.CONFIRMATION_MACD_SIGNAL_PERIOD}'] = macd_1m[f'MACD_{config.CONFIRMATION_MACD_FAST_PERIOD}_{config.CONFIRMATION_MACD_SLOW_PERIOD}_{config.CONFIRMATION_MACD_SIGNAL_PERIOD}'].shift(1)
+        df[f'macd_1m_{config.CONFIRMATION_MACD_FAST_PERIOD}_{config.CONFIRMATION_MACD_SLOW_PERIOD}_{config.CONFIRMATION_MACD_SIGNAL_PERIOD}'] = macd_1m[f'MACD_{config.CONFIRMATION_MACD_FAST_PERIOD}_{config.CONFIRMATION_MACD_SLOW_PERIOD}_{config.CONFIRMATION_MACD_SIGNAL_PERIOD}'] # .shift(1) removed
+        # ---------------------------------------
 
     def _calculate_30m_indicators(self, symbol: str) -> dict:
         df = self.dataframes.get(f"{symbol}_30m")
@@ -268,7 +270,6 @@ class LiveDataManager:
 
     def _on_1m_candle(self, candle_data, symbol: str):
         # Update liveness tracker REGARDLESS of confirmation
-        # This proves the socket is alive and sending data
         self.liveness_tracker[f"{symbol}_1m"] = time.time()
         
         if not candle_data.get('confirm', False):
@@ -340,17 +341,15 @@ class LiveDataManager:
             if not isinstance(current_1m_row, pd.Series) or not current_30m_row:
                 return 
 
-            # --- FIX: Data Stitch Validator (Staleness Check) ---
+            # --- FIX 2: STALENESS CHECK TIGHTENED ---
             ts_30m = current_30m_row.get('timestamp')
             ts_1m = current_1m_row.get('timestamp')
             
             if ts_30m and ts_1m:
                 time_diff_seconds = (ts_1m - ts_30m).total_seconds()
-                if time_diff_seconds > 3720: # 62 mins
-                    # Rate limit logging for this warning
-                    # (Optimization: Could add a timer here to avoid flooding logs)
+                if time_diff_seconds > 1860: # Changed from 3720 to 1860 (31 mins)
                     return 
-            # ----------------------------------------------------
+            # ----------------------------------------
 
             merged_current_row = pd.concat([pd.Series(current_30m_row), current_1m_row])
             atr_30m = current_30m_row.get('atr', 0.0)
@@ -480,9 +479,7 @@ class Venue:
                         new_pos.entry_time = time.time()
                         new_pos.symbol = bot.symbol
                         
-                        # --- FIX: Robust Orphan Adoption ---
                         new_pos.entry_regime = "adopted_orphan" 
-                        # -----------------------------------
                         
                         bot.open_positions.append(new_pos)
                         found_bot = True
@@ -530,6 +527,30 @@ class Venue:
         while True:
             try:
                 realized_capital = self.connector.get_wallet_balance("USDT")
+                
+                # --- FIX 3: INDIVIDUAL NOTIONAL STATE TRACKING ---
+                # Pre-fetch mark prices for all symbols involved to avoid loop latency
+                unique_symbols = set(b.symbol for b in self.bots)
+                mark_prices = {}
+                for s in unique_symbols:
+                    try:
+                        mark_prices[s] = self.connector.get_mark_price(s)
+                    except Exception:
+                        mark_prices[s] = 0.0
+
+                for bot in self.bots:
+                    bot_upl = 0.0
+                    current_price = mark_prices.get(bot.symbol, 0.0)
+                    if current_price > 0:
+                        for pos in bot.open_positions:
+                            bot_upl += pos.calculate_profit(current_price)
+                    
+                    # Update individual notional state used for risk calculation
+                    bot.notional_unrealized_pnl = bot_upl
+                    current_notional_equity = bot.notional_capital + bot.notional_unrealized_pnl
+                    bot.notional_peak_equity = max(bot.notional_peak_equity, current_notional_equity)
+                # -------------------------------------------------
+
                 unrealized_pnl = 0.0
                 try:
                     open_positions = self.connector.get_open_positions()
@@ -609,7 +630,6 @@ class EnsembleTrader:
 
             logger.info("All venues running. Waiting for exit signal (Ctrl+C).")
             
-            # --- FIX: Multi-Channel Watchdog Main Loop ---
             while True:
                 time.sleep(1) 
                 
@@ -617,7 +637,6 @@ class EnsembleTrader:
                 for venue in self.venues:
                     if not venue.data_manager: continue
                     
-                    # Iterate over all tracked streams (e.g., BTC/USDT_1m, BTC/USDT_30m)
                     for stream_key, last_ts in list(venue.data_manager.liveness_tracker.items()):
                         if current_time - last_ts > WATCHDOG_TIMEOUT_SECONDS:
                             logger.error(f"🚨 [WATCHDOG] Stream '{stream_key}' died! Last update: {int(current_time - last_ts)}s ago. Triggering Venue Reconnect...")
@@ -628,25 +647,21 @@ class EnsembleTrader:
                                 venue.connector.connect()
                                 venue.data_manager.start_all_streams() 
                                 
-                                # Reset all keys to now to prevent infinite loops
                                 now = time.time()
                                 for k in venue.data_manager.liveness_tracker.keys():
                                     venue.data_manager.liveness_tracker[k] = now
                                     
                                 logger.info(f"✅ [WATCHDOG] Venue '{venue.name}' reconnected successfully.")
-                                break # Break inner loop to restart venue monitoring
+                                break 
                             except Exception as e:
                                  logger.error(f"❌ [WATCHDOG] Reconnect failed: {e}")
-                                 # Update timestamp to prevent log flooding, hope next cycle fixes it
                                  venue.data_manager.liveness_tracker[stream_key] = time.time() 
-                # -------------------------------
 
         except KeyboardInterrupt:
             logger.info("Shutdown signal received (Ctrl+C).")
         except Exception as e:
             logger.error(f"Fatal error in main loop: {e}", exc_info=True)
         finally:
-            # --- FIX: Shutdown Protocol (Panic Close) ---
             logger.warning("🛑 [SHUTDOWN PROTOCOL] Initiating Emergency Shutdown...")
             for venue in self.venues:
                 if not venue.bots: continue
@@ -662,7 +677,6 @@ class EnsembleTrader:
                                 time.sleep(0.2) 
                             except Exception as e:
                                 logger.error(f"Failed to panic close position {pos.id}: {e}")
-            # --------------------------------------------
             
             logger.info("Disconnecting all venues...")
             for venue in self.venues:
