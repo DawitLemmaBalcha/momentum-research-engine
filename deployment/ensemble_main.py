@@ -193,7 +193,7 @@ class LiveDataManager:
         df['bb_lower'] = bbands[bbl_col]
         df['bb_upper'] = bbands[bbu_col]
         
-        return df.iloc[-2].to_dict()
+        return df.iloc[-1].to_dict()
 
     def _get_trend_regime(self, data_row: dict, symbol: str) -> str:
         try:
