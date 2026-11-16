@@ -3,9 +3,12 @@ __pycache__/
 *.pyc
 /connectors/__pycache__/
 vtwo/
+.venv/
+.pytest_cache/
 
 # Local config
 api.env
+.env
 
 # Output folders
 data/

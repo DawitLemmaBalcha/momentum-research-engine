@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 from typing import List, Tuple
 from dataclasses import dataclass
-from collections import defaultdict
+from collections import defaultdict, deque
 from abc import ABC, abstractmethod
 from core.core_types import Position, Order, SimulationClock, TradeLog, Tick
 from connectors.base_connector import BaseConnector
@@ -46,6 +46,72 @@ class MomentumAnchorBotBase(ABC):
         self.total_anchors_triggered = 0
         self.portfolio_initial_capital = initial_capital
         self.capital_allocation = 1.0
+        timesfm_context = int(getattr(self.config, 'TIMESFM_CONTEXT', 512))
+        self._close_history = deque(maxlen=timesfm_context)
+        self._close_history_times = deque(maxlen=timesfm_context)
+        self.forecast_gate = self._build_forecast_gate()
+
+    def _build_forecast_gate(self):
+        """Build the optional TimesFM entry gate. Disabled unless configured."""
+        if not getattr(self.config, 'TIMESFM_ENABLED', False):
+            return None
+        from forecasting import ForecastGate, TimesFMForecaster
+
+        horizon = int(getattr(self.config, 'TIMESFM_HORIZON', 5))
+        forecaster = TimesFMForecaster(
+            checkpoint=getattr(self.config, 'TIMESFM_CHECKPOINT', 'google/timesfm-2.5-200m-pytorch'),
+            max_context=int(getattr(self.config, 'TIMESFM_CONTEXT', 512)),
+            max_horizon=max(horizon, int(getattr(self.config, 'TIMESFM_MAX_HORIZON', 64))),
+        )
+        return ForecastGate(
+            forecaster,
+            horizon=horizon,
+            min_context=int(getattr(self.config, 'TIMESFM_MIN_CONTEXT', 64)),
+            min_agreement=float(getattr(self.config, 'TIMESFM_MIN_AGREEMENT', 0.6)),
+            min_expected_return_pct=float(getattr(self.config, 'TIMESFM_MIN_EXPECTED_RETURN_PCT', 0.0)),
+            cache_bars=int(getattr(self.config, 'TIMESFM_CACHE_BARS', 5)),
+            bar_seconds=float(getattr(self.config, 'TIMESFM_BAR_SECONDS', 60.0)),
+            fail_open=bool(getattr(self.config, 'TIMESFM_FAIL_OPEN', False)),
+        )
+
+    def observe_close(self, timestamp: float, close: float) -> None:
+        """Record one closed bar for the forecast gate.
+
+        Bars are appended in time order and duplicate or older timestamps are
+        ignored so a tick loop can call this safely once per bar.
+        """
+        if self.forecast_gate is None:
+            return
+        try:
+            ts = float(timestamp)
+            price = float(close)
+        except (TypeError, ValueError):
+            return
+        if not np.isfinite(ts) or not np.isfinite(price) or price <= 0:
+            return
+        if self._close_history_times and ts <= self._close_history_times[-1]:
+            return
+        self._close_history.append(price)
+        self._close_history_times.append(ts)
+
+    def _entry_allowed(self, order: Order) -> bool:
+        gate = self.forecast_gate
+        if gate is None or len(self._close_history) < gate.min_context:
+            return True
+        decision = gate.evaluate(list(self._close_history), side=order.order_type, timestamp=self.clock.time())
+        if decision.allowed:
+            return True
+        if not self.silent:
+            detail = decision.reason
+            if decision.agreement is not None:
+                detail += f" (agreement={decision.agreement:.2f}"
+                if decision.expected_return_pct is not None:
+                    detail += f", expected_return={decision.expected_return_pct:.3f}%"
+                detail += ")"
+            self.logger.info(
+                f"{format_time(self.clock.time())} - [TIMESFM VETO] {order.order_type} @ {order.price:,.2f}: {detail}"
+            )
+        return False
 
     @abstractmethod
     def calculate_position_size(self, price: float, return_details: bool = False) -> float | Tuple[float, str]:
@@ -204,6 +270,9 @@ class MomentumAnchorBotBase(ABC):
                 self.logger.info(f"{current_time_str} - ⏩ Skipping trade. Calculated size is {amount:.5f}.")
             return False
         
+        if not self._entry_allowed(order):
+            return False
+
         direction = 'LONG' if order.order_type == 'buy' else 'SHORT'
         if not self.silent: self.logger.info(f"{current_time_str} - 📲 Attempting to place order via connector: {order.order_type} {amount:.5f} {self.symbol}")
 

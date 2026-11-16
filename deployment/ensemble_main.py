@@ -357,6 +357,9 @@ class LiveDataManager:
             for bot in self.bots_by_symbol[symbol]:
                 bot.clock.current_time = tick.timestamp
                 bot.clock.current_price = tick.price
+
+                if ts_1m is not None and current_1m_row.get('close') is not None:
+                    bot.observe_close(ts_1m.timestamp(), current_1m_row['close'])
                 
                 bot.check_confirmation_on_tick(
                     tick,

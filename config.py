@@ -124,3 +124,17 @@ DE_RISK_LOWER_BOUND = 0.1
 # How fast to restore sizing when the bot is performing well (at a new peak).
 # 0.05 = Restore sizing by 5% of its current level per 30m candle.
 RE_RISK_AGGRESSION = 0.5
+# -- Optional TimesFM entry gate -------------------------------------------
+# Off by default. Install requirements-timesfm.txt and set TIMESFM_ENABLED to
+# True to veto anchor entries whose direction a TimesFM forecast does not
+# support. The rest of the engine is unchanged when this block is absent.
+TIMESFM_ENABLED = False
+TIMESFM_CHECKPOINT = 'google/timesfm-2.5-200m-pytorch'  # Apache-2.0 weights
+TIMESFM_CONTEXT = 512
+TIMESFM_HORIZON = 5
+TIMESFM_MIN_CONTEXT = 64
+TIMESFM_MIN_AGREEMENT = 0.6
+TIMESFM_MIN_EXPECTED_RETURN_PCT = 0.0
+TIMESFM_CACHE_BARS = 5
+TIMESFM_BAR_SECONDS = 60
+TIMESFM_FAIL_OPEN = False

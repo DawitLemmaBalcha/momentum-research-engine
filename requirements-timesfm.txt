@@ -1,0 +1,8 @@
+# Optional TimesFM entry gate.
+#
+# The default checkpoint below is TimesFM 2.5, whose pretrained weights are
+# Apache-2.0. TimesFM 3.0 weights are non-commercial, so the extra pins below
+# the 3.x line on purpose.
+#
+# Python 3.10-3.12 with a PyTorch wheel for the target platform.
+timesfm[torch]>=2.0.2,<3

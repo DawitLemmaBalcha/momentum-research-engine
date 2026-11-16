@@ -291,6 +291,9 @@ class SimulationEngine:
             
             o, h, l, c, v, base_ts = current_row['open'], current_row['high'], current_row['low'], current_row['close'], current_row['volume'], current_row['timestamp'].timestamp()
             
+            for bot in self.bots:
+                bot.observe_close(base_ts, c)
+
             if c > o: key_prices = [o, l, h, c]
             else: key_prices = [o, h, l, c]
             
