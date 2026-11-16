@@ -1,6 +1,8 @@
-# Momentum-Confirmed Volatility-Adjusted Engine
+# Momentum Research Engine
 
-[![tests](https://github.com/DawitLemmaBalcha/Momentum-Confirmed_Volatility-Adjusted_Engine/actions/workflows/ci.yml/badge.svg)](https://github.com/DawitLemmaBalcha/Momentum-Confirmed_Volatility-Adjusted_Engine/actions/workflows/ci.yml)
+Volatility-adjusted momentum, replayed tick by tick.
+
+[![tests](https://github.com/DawitLemmaBalcha/momentum-research-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/DawitLemmaBalcha/momentum-research-engine/actions/workflows/ci.yml)
 ![python](https://img.shields.io/badge/python-3.10--3.12-blue)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
